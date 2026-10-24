@@ -73,6 +73,16 @@ Synced by default: `memory` and `skills` (`~/.claude/skills`, minus `synced/`). 
 `settings.local.json`), any directory of notes. Plugins are compared, not copied. Never sync
 session transcripts or caches.
 
+## Cost
+
+R2 free tier per month: 10 GB storage, 1 M Class A requests (PUT, LIST), 10 M Class B
+(GET, HEAD); egress free. Beyond that: $0.015/GB-month, $4.50/M Class A, $0.36/M Class B
+([pricing](https://developers.cloudflare.com/r2/pricing/)).
+
+engram with two devices and five collections uses about 1 MB of storage plus one LIST and one
+conditional GET per collection per prompt, and two PUTs per saved memory. At 200 prompts a day
+that is ~30 k Class A and ~30 k Class B per month, well inside the free tier: **$0**.
+
 ## Limits
 
 - Claude Code loads only the first 200 lines / 25 KB of `MEMORY.md`. engram merges the index
