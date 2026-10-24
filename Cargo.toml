@@ -25,7 +25,7 @@ aws-config = { version = "1", features = ["behavior-version-latest"] }
 aws-sdk-s3 = "1"
 aws-credential-types = "1"
 walkdir = "2"
-dirs = "6"
+dirs = "7"
 chrono = "0.4"
 
 [profile.release]
