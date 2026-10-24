@@ -19,7 +19,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 sha2 = "0.10"
 hex = "0.4"
-age = { version = "0.11", default-features = false }
+age = { version = "0.12", default-features = false }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
 aws-config = { version = "1", features = ["behavior-version-latest"] }
 aws-sdk-s3 = "1"
