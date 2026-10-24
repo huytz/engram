@@ -1,0 +1,3 @@
+target/
+*.conflict-*
+.DS_Store
