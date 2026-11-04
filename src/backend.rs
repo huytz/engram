@@ -139,6 +139,56 @@ impl Backend {
         }
     }
 
+    /// Immediate child names under `prefix` (S3 delimiter listing, no recursion into blobs)
+    pub async fn list_children(&self, prefix: &str) -> Result<Vec<String>> {
+        match self {
+            Backend::File { root } => {
+                let base = root.join(prefix);
+                let Ok(rd) = std::fs::read_dir(&base) else {
+                    return Ok(vec![]);
+                };
+                Ok(rd
+                    .filter_map(|e| e.ok())
+                    .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
+                    .map(|e| e.file_name().to_string_lossy().into_owned())
+                    .collect())
+            }
+            Backend::S3 { client, bucket } => {
+                let mut out = vec![];
+                let mut token = None;
+                loop {
+                    let mut req = client
+                        .list_objects_v2()
+                        .bucket(bucket)
+                        .prefix(prefix)
+                        .delimiter("/");
+                    if let Some(t) = &token {
+                        req = req.continuation_token(t);
+                    }
+                    let resp = req
+                        .send()
+                        .await
+                        .map_err(|e| anyhow!("s3 list: {}", e.into_service_error()))?;
+                    for cp in resp.common_prefixes() {
+                        if let Some(name) = cp
+                            .prefix()
+                            .and_then(|k| k.strip_prefix(prefix))
+                            .map(|k| k.trim_end_matches('/'))
+                            .filter(|k| !k.is_empty())
+                        {
+                            out.push(name.to_string());
+                        }
+                    }
+                    match resp.next_continuation_token() {
+                        Some(t) => token = Some(t.to_string()),
+                        None => break,
+                    }
+                }
+                Ok(out)
+            }
+        }
+    }
+
     /// All keys under `prefix`
     pub async fn list(&self, prefix: &str) -> Result<Vec<String>> {
         match self {

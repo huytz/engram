@@ -46,6 +46,11 @@ fn excluded(rel: &str, col: &Collection) -> bool {
 }
 
 pub fn scan(col: &Collection) -> Result<BTreeMap<String, Local>> {
+    scan_since(col, None)
+}
+
+/// Like `scan`, but reuses the sha from `prev` when size+mtime match so unchanged files are not read
+pub fn scan_since(col: &Collection, prev: Option<&Manifest>) -> Result<BTreeMap<String, Local>> {
     let root = expand(&col.path);
     let mut out = BTreeMap::new();
     if !root.exists() {
@@ -67,16 +72,23 @@ pub fn scan(col: &Collection) -> Result<BTreeMap<String, Local>> {
         if excluded(&rel, col) {
             continue;
         }
-        let data = std::fs::read(e.path())?;
         let md = e.metadata()?;
         let mtime = md
             .modified()?
             .duration_since(std::time::UNIX_EPOCH)?
             .as_secs() as i64;
+        let cached = prev
+            .and_then(|m| m.files.get(&rel))
+            .filter(|p| p.size == md.len() && p.mtime == mtime)
+            .and_then(|p| p.sha.clone());
+        let sha = match cached {
+            Some(sha) => sha,
+            None => sha256_hex(&std::fs::read(e.path())?),
+        };
         out.insert(
             rel,
             Local {
-                sha: sha256_hex(&data),
+                sha,
                 size: md.len(),
                 mtime,
             },
@@ -123,8 +135,8 @@ impl<'a> Syncer<'a> {
     /// Upload local changes of `col` under our device prefix; returns number of changed entries
     pub async fn push(&mut self, col: &Collection) -> Result<usize> {
         let dev = &self.cfg.device;
-        let local = scan(col)?;
         let own = self.state.own.get(&col.name).cloned().unwrap_or_default();
+        let local = scan_since(col, Some(&own))?;
         let mut files: BTreeMap<String, Entry> = BTreeMap::new();
         let mut changed = 0usize;
         let now = now_ts();
@@ -208,14 +220,13 @@ impl<'a> Syncer<'a> {
         };
         let index_before = std::fs::read_to_string(root.join(INDEX)).unwrap_or_default();
 
-        let keys = self.backend.list(&format!("{}/", col.name)).await?;
-        let mut devices: Vec<String> = keys
-            .iter()
-            .filter_map(|k| {
-                let parts: Vec<&str> = k.split('/').collect();
-                (parts.len() == 3 && parts[2] == "manifest.json" && parts[1] != self.cfg.device)
-                    .then(|| parts[1].to_string())
-            })
+        // Device prefixes only; listing every blob key made each prompt take seconds
+        let mut devices: Vec<String> = self
+            .backend
+            .list_children(&format!("{}/", col.name))
+            .await?
+            .into_iter()
+            .filter(|d| d != &self.cfg.device)
             .collect();
         devices.sort();
         devices.dedup();
