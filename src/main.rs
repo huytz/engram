@@ -119,8 +119,13 @@ fn log(msg: &str) {
 struct Lock(std::path::PathBuf);
 impl Lock {
     fn acquire() -> Result<Lock> {
+        Self::acquire_within(100)
+    }
+
+    /// Try for `tries` x 100ms; per-prompt pulls must give up well inside the hook timeout
+    fn acquire_within(tries: u32) -> Result<Lock> {
         let p = home().join("lock");
-        for _ in 0..100 {
+        for _ in 0..tries {
             match std::fs::OpenOptions::new()
                 .write(true)
                 .create_new(true)
@@ -436,10 +441,18 @@ fn default_project_memory() -> Option<std::path::PathBuf> {
 
 async fn hook(event: &str) -> Result<()> {
     let cfg = Config::load()?;
+    if event == "userpromptsubmit" {
+        // Busy = a push is running; skip this prompt instead of stalling it
+        let Ok(_lock) = Lock::acquire_within(10) else {
+            return Ok(());
+        };
+        // Only memory surfaces index lines mid-session; other collections wait for SessionStart
+        let only = cfg.collection("memory").map(|c| c.name.as_str());
+        return do_pull(&cfg, only, true).await;
+    }
     let _lock = Lock::acquire()?;
     match event {
         "sessionstart" => do_pull(&cfg, None, true).await,
-        "userpromptsubmit" => do_pull(&cfg, None, true).await,
         "posttooluse" => {
             let Some(fp) = hooks::stdin_file_path() else {
                 return Ok(());
