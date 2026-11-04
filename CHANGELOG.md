@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.1.1 — 2026-11-04
+
 - Per-prompt pull lists only device prefixes (S3 delimiter) instead of every blob key, and pulls
   only the `memory` collection; other collections still pull on SessionStart. ~3.5s → ~0.6s on R2.
 - Per-prompt pull skips after ~1s when a push holds the lock, instead of waiting past the 5s hook
