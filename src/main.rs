@@ -173,9 +173,10 @@ struct Out {
     timing: Vec<String>,
 }
 
-async fn do_pull(cfg: &Config, only: Option<&str>, out: &mut Out) -> Result<()> {
+async fn do_pull(cfg: &Config, only: Option<&str>, cached_list: bool, out: &mut Out) -> Result<()> {
     let (keys, be) = open(cfg).await?;
     let mut s = Syncer::new(cfg, &keys, &be)?;
+    s.cached_list = cached_list;
     let mut err = None;
     for (c, r) in s.pull_all(&cols(cfg, only)).await {
         let r = match r {
@@ -253,7 +254,7 @@ async fn do_push(cfg: &Config, only: Option<&str>, out: &mut Out) -> Result<()> 
 /// CLI flavour: print pull lines, or "up to date" when nothing came in
 async fn cli_pull(cfg: &Config, only: Option<&str>) -> Result<()> {
     let mut out = Out::default();
-    let r = do_pull(cfg, only, &mut out).await;
+    let r = do_pull(cfg, only, false, &mut out).await;
     print_lines(&out.lines, "engram: up to date");
     r
 }
@@ -439,6 +440,7 @@ async fn init(
         secret_access_key: secret_key,
         collections,
         hook_timing: true,
+        device_list_ttl: 600,
     };
     cfg.save()?;
     let keys = Keys::load_or_create()?;
@@ -503,12 +505,12 @@ async fn hook(
         };
         // Only memory surfaces index lines mid-session; other collections wait for SessionStart
         let only = cfg.collection("memory").map(|c| c.name.as_str());
-        do_pull(cfg, only, out).await?;
+        do_pull(cfg, only, true, out).await?;
         return Ok("pull");
     }
     let _lock = Lock::acquire()?;
     match event {
-        "sessionstart" => do_pull(cfg, None, out).await.map(|_| "pull"),
+        "sessionstart" => do_pull(cfg, None, false, out).await.map(|_| "pull"),
         "posttooluse" => {
             let Some(fp) = hooks::stdin_file_path() else {
                 return Ok("");

@@ -52,7 +52,34 @@ rm "$T/b/memory/thing-y.md"; b push >/dev/null; a pull >/dev/null
 a push >/dev/null; b pull >/dev/null
 [ ! -e "$T/b/memory/thing-y.md" ] || fail "deleted file resurrected"
 
-# 6. wrong identity fails cleanly
+# 6. prompt hook reuses device list; session start and expired TTL re-LIST
+mkdir -p "$T/c" "$T/seed-c"; cp "$T/a/identity.txt" "$T/c/"
+printf '# Memory Index\n\n## Rules\n- [rule C](rule-c.md) — from c\n' > "$T/seed-c/MEMORY.md"; echo "rule C body" > "$T/seed-c/rule-c.md"
+ENGRAM_HOME="$T/c" "$BIN" init --device dev-c --remote "file://$T/remote" --import "$T/seed-c" --no-skills >/dev/null
+a hook userpromptsubmit >/dev/null
+[ -e "$T/a/memory/rule-c.md" ] && fail "prompt hook should reuse cached device list"
+a hook sessionstart >/dev/null
+[ -e "$T/a/memory/rule-c.md" ] || fail "session start must LIST and see new device"
+echo "rule C2" > "$T/seed-c/rule-c2.md"; cp "$T/seed-c/rule-c2.md" "$T/c/memory/"; ENGRAM_HOME="$T/c" "$BIN" push >/dev/null
+a hook userpromptsubmit >/dev/null
+[ -e "$T/a/memory/rule-c2.md" ] || fail "known device must still be fetched on prompt"
+mkdir -p "$T/d"; cp "$T/a/identity.txt" "$T/d/"
+ENGRAM_HOME="$T/d" "$BIN" init --device dev-d --remote "file://$T/remote" --import "$T/seed-c" --no-skills >/dev/null
+echo "rule D" > "$T/d/memory/rule-d.md"; ENGRAM_HOME="$T/d" "$BIN" push >/dev/null
+sed -i.bak 's/"device_list_ttl": *[0-9]*/"device_list_ttl": 0/' "$T/a/config.json" && rm "$T/a/config.json.bak"
+a hook userpromptsubmit >/dev/null
+[ -e "$T/a/memory/rule-d.md" ] || fail "expired TTL must LIST and see new device"
+
+# 7. new blobs ride inline; a reader two pushes behind uses blob GETs
+echo "inline body" > "$T/b/memory/inl.md"; b push >/dev/null
+rm "$T/remote/memory/dev-b/blobs/$(shasum -a 256 "$T/b/memory/inl.md" | cut -d' ' -f1)"
+a pull >/dev/null; [ "$(cat "$T/a/memory/inl.md")" = "inline body" ] || fail "inline blob not applied"
+echo "lag 1" > "$T/b/memory/lag1.md"; b push >/dev/null
+echo "lag 2" > "$T/b/memory/lag2.md"; b push >/dev/null
+a pull >/dev/null; [ "$(cat "$T/a/memory/lag1.md")" = "lag 1" ] || fail "lagging reader missed blob"
+grep -q '"inline"' "$T/b/state.json" && fail "inline content leaked into state"
+
+# 8. wrong identity fails cleanly
 mkdir -p "$T/x"; sed 's/dev-a/intruder/' "$T/a/config.json" > "$T/x/config.json"
 { ENGRAM_HOME="$T/x" "$BIN" pull 2>&1 || true; } | grep -q "wrong identity" || fail "wrong identity should be rejected"
 

@@ -27,10 +27,17 @@ pub struct Config {
     /// Show per-hook timings in Claude Code (`systemMessage`)
     #[serde(default = "yes")]
     pub hook_timing: bool,
+    /// Seconds the prompt hook reuses the device list before a new LIST
+    #[serde(default = "list_ttl")]
+    pub device_list_ttl: u64,
 }
 
 fn yes() -> bool {
     true
+}
+
+fn list_ttl() -> u64 {
+    600
 }
 
 /// `$ENGRAM_HOME` or `~/.engram`

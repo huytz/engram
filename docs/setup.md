@@ -51,9 +51,10 @@ R2 free tier per month: 10 GB storage, 1 M Class A requests (PUT, LIST), 10 M Cl
 (GET, HEAD); egress free. Beyond that: $0.015/GB-month, $4.50/M Class A, $0.36/M Class B
 ([pricing](https://developers.cloudflare.com/r2/pricing/)).
 
-engram with two devices and five collections uses about 1 MB of storage plus one LIST and one
-conditional GET for `memory` per prompt, and two PUTs per saved memory. At 200 prompts a day
-that is ~30 k Class A and ~30 k Class B per month, well inside the free tier: **$0**.
+engram with two devices and five collections uses about 1 MB of storage plus one conditional
+GET for `memory` per prompt (the device LIST is reused for 10 minutes), and two PUTs per saved
+memory. At 200 prompts a day that is a few k Class A and ~30 k Class B per month, well inside
+the free tier: **$0**.
 
 ## Limits
 
@@ -62,4 +63,6 @@ that is ~30 k Class A and ~30 k Class B per month, well inside the free tier: **
 - One memory for all projects (`autoMemoryDirectory` is global).
 - `ENGRAM_HOME` moves `~/.engram`; `file:///dir` is a valid remote for testing.
 - Hooks show their timing in Claude Code; set `"hook_timing": false` in `config.json` to hide it.
+- The prompt hook reuses the device list for `"device_list_ttl"` seconds (default 600), so a new
+  device shows up at the next session start or within 10 minutes; `0` LISTs on every prompt.
 - TLS roots are read from the OS once a day into `~/.engram/roots.pem`; delete it after adding a CA.

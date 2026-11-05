@@ -31,6 +31,9 @@ pub struct Manifest {
     pub seq: u64,
     pub updated_at: String,
     pub files: BTreeMap<String, Entry>,
+    /// sha -> base64 of blobs new in this push; readers skip their GET
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub inline: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -54,6 +57,9 @@ pub struct State {
     /// collection -> our own last pushed manifest
     #[serde(default)]
     pub own: BTreeMap<String, Manifest>,
+    /// collection -> unix time of the last device LIST
+    #[serde(default)]
+    pub listed_at: BTreeMap<String, i64>,
     /// sha of the plugin list last published
     #[serde(default)]
     pub plugins_sha: Option<String>,

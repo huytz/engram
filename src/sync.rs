@@ -3,6 +3,8 @@ use crate::config::{Collection, Config, expand};
 use crate::crypto::{Keys, sha256_hex};
 use crate::model::{Entry, Manifest, State, now_rfc3339, now_ts};
 use anyhow::{Context, Result};
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD as B64;
 use futures_util::future::join_all;
 use futures_util::stream::{self, StreamExt};
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -13,6 +15,8 @@ const TOMBSTONE_TTL: i64 = 90 * 86400;
 const INDEX: &str = "MEMORY.md";
 /// In-flight blob requests per device/collection; R2 speaks HTTP/1.1 so each is its own connection
 const PARALLEL: usize = 16;
+/// Raw bytes of new blobs a manifest may carry inline
+const INLINE_MAX: usize = 256 * 1024;
 
 pub struct Local {
     pub sha: String,
@@ -47,6 +51,8 @@ pub struct Syncer<'a> {
     pub keys: &'a Keys,
     pub backend: &'a Backend,
     pub state: State,
+    /// Reuse the device list from state while younger than `device_list_ttl`
+    pub cached_list: bool,
 }
 
 /// Conflict copies stay local so one device's mess never spreads to the others
@@ -161,6 +167,7 @@ impl<'a> Syncer<'a> {
             keys,
             backend,
             state: State::load()?,
+            cached_list: false,
         })
     }
 
@@ -276,11 +283,28 @@ impl<'a> Syncer<'a> {
         if changed == 0 && own.seq > 0 {
             return Ok(None);
         }
+        let root = expand(&col.path);
+        let mut inline = BTreeMap::new();
+        let mut budget = INLINE_MAX;
+        for (rel, sha) in &uploads {
+            let size = local[rel].size as usize;
+            if size > budget {
+                continue;
+            }
+            let data = std::fs::read(root.join(rel)).with_context(|| format!("read {rel}"))?;
+            // Changed since scan: blob path; next push sends the new sha
+            if sha256_hex(&data) != *sha {
+                continue;
+            }
+            budget -= data.len();
+            inline.insert(sha.clone(), B64.encode(&data));
+        }
         let manifest = Manifest {
             device: dev.clone(),
             seq: own.seq + 1,
             updated_at: now_rfc3339(),
             files,
+            inline,
         };
         Ok(Some(PushPlan {
             col,
@@ -291,25 +315,41 @@ impl<'a> Syncer<'a> {
         }))
     }
 
-    /// PUT new blobs in parallel, then the manifest; PUT is idempotent so no HEAD probe first
+    /// PUT non-inline blobs, then manifest ∥ inline blobs: 1 round trip if all fit
     async fn upload(&self, plan: &PushPlan<'_>) -> Result<()> {
         let (col, dev) = (&plan.col.name, &self.cfg.device);
         let root = expand(&plan.col.path);
-        let mut puts = stream::iter(plan.uploads.iter().map(|(rel, sha)| {
-            let path = root.join(rel);
-            async move {
-                let data = std::fs::read(&path).with_context(|| format!("read {rel}"))?;
-                self.backend
-                    .put(&blob_key(col, dev, sha), self.keys.encrypt(&data)?)
-                    .await
-            }
-        }))
-        .buffer_unordered(PARALLEL);
-        while let Some(r) = puts.next().await {
+        let put_blobs = |inlined: bool| {
+            let root = &root;
+            stream::iter(
+                plan.uploads
+                    .iter()
+                    .filter(move |(_, sha)| plan.manifest.inline.contains_key(sha) == inlined)
+                    .map(move |(rel, sha)| async move {
+                        let data = match plan.manifest.inline.get(sha) {
+                            Some(b) => B64.decode(b)?,
+                            None => std::fs::read(root.join(rel))
+                                .with_context(|| format!("read {rel}"))?,
+                        };
+                        self.backend
+                            .put(&blob_key(col, dev, sha), self.keys.encrypt(&data)?)
+                            .await
+                    }),
+            )
+            .buffer_unordered(PARALLEL)
+            .collect::<Vec<Result<()>>>()
+        };
+        // Readers of the new manifest need these blobs before it lands
+        for r in put_blobs(false).await {
             r?;
         }
         let body = self.keys.encrypt(&serde_json::to_vec(&plan.manifest)?)?;
-        self.backend.put(&manifest_key(col, dev), body).await
+        let key = manifest_key(col, dev);
+        let (inlined, manifest) = tokio::join!(put_blobs(true), self.backend.put(&key, body));
+        for r in inlined {
+            r?;
+        }
+        manifest
     }
 
     fn commit_push(&mut self, plan: PushPlan<'_>) {
@@ -319,7 +359,9 @@ impl<'a> Syncer<'a> {
             applied.insert(rel.clone(), l.sha.clone());
         }
         applied.retain(|k, _| plan.local.contains_key(k));
-        self.state.own.insert(name.clone(), plan.manifest);
+        let mut manifest = plan.manifest;
+        manifest.inline.clear();
+        self.state.own.insert(name.clone(), manifest);
     }
 
     /// Fetch every collection concurrently, then merge sequentially; one result per collection
@@ -336,7 +378,11 @@ impl<'a> Syncer<'a> {
         let mut out = vec![];
         let mut dirty = false;
         for (col, (f, ms)) in cols.iter().zip(fetched) {
-            let r = f.and_then(|remotes| {
+            let r = f.and_then(|(remotes, listed)| {
+                if listed {
+                    self.state.listed_at.insert(col.name.clone(), now_ts());
+                    dirty = true;
+                }
                 dirty |= !remotes.is_empty();
                 self.apply_col(col, remotes)
             });
@@ -382,8 +428,8 @@ impl<'a> Syncer<'a> {
         Ok(report)
     }
 
-    /// LIST runs alongside the GETs for already-known devices, so a quiet pull costs one round trip
-    async fn fetch_col(&self, col: &Collection) -> Result<Vec<Remote>> {
+    /// LIST ∥ known-device GETs, LIST skipped if cache fresh; returns (remotes, listed)
+    async fn fetch_col(&self, col: &Collection) -> Result<(Vec<Remote>, bool)> {
         let me = self.cfg.device.as_str();
         let known: Vec<String> = self
             .state
@@ -393,12 +439,26 @@ impl<'a> Syncer<'a> {
             .flat_map(|m| m.keys().cloned())
             .filter(|d| d != me)
             .collect();
+        let fresh_list = self.cached_list
+            && !known.is_empty()
+            && self
+                .state
+                .listed_at
+                .get(&col.name)
+                .is_some_and(|t| now_ts().saturating_sub(*t) < self.cfg.device_list_ttl as i64);
         let prefix = format!("{}/", col.name);
-        let (listed, known_res) = tokio::join!(
-            self.backend.list_children(&prefix),
-            join_all(known.iter().map(|d| self.fetch_dev(col, d)))
-        );
-        let mut fresh: Vec<String> = listed?
+        let list = async {
+            match fresh_list {
+                true => Ok(None),
+                false => self.backend.list_children(&prefix).await.map(Some),
+            }
+        };
+        let (listed, known_res) =
+            tokio::join!(list, join_all(known.iter().map(|d| self.fetch_dev(col, d))));
+        let listed = listed?;
+        let did_list = listed.is_some();
+        let mut fresh: Vec<String> = listed
+            .unwrap_or_default()
             .into_iter()
             .filter(|d| d != me && !known.contains(d))
             .collect();
@@ -410,7 +470,7 @@ impl<'a> Syncer<'a> {
             out.extend(r?);
         }
         out.sort_by(|a, b| a.dev.cmp(&b.dev));
-        Ok(out)
+        Ok((out, did_list))
     }
 
     /// Conditional GET of a device manifest plus a parallel fetch of the blobs it will need
@@ -451,6 +511,20 @@ impl<'a> Syncer<'a> {
         need.sort_unstable();
         need.dedup();
         let mut blobs = HashMap::new();
+        need.retain(|sha| {
+            let hit = manifest
+                .inline
+                .get(sha)
+                .and_then(|b| B64.decode(b).ok())
+                .filter(|d| sha256_hex(d) == *sha);
+            match hit {
+                Some(d) => {
+                    blobs.insert(sha.clone(), d);
+                    false
+                }
+                None => true,
+            }
+        });
         let mut gets = stream::iter(need.into_iter().map(|sha| async move {
             match self
                 .backend

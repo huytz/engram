@@ -36,23 +36,24 @@ Claude Code features (`autoMemoryDirectory`, hooks).
 
 ## Benchmark
 
-`scripts/bench.py target/release/engram`, 10 rounds, 2026-11-05, Apple M5 / 16 GB, macOS, home
-network to Cloudflare R2 (~150 ms RTT). Real data: 5 collections, ~1,100 files; write cases
-use a scratch collection of 400 × 5 KB files.
+`scripts/bench.py target/release/engram`, v0.1.3, 10 rounds (prompt hook 20), 2026-11-05,
+Apple M5 / 16 GB, macOS, home network to Cloudflare R2 (~150 ms RTT). Real data: 5 collections,
+~1,100 files; write cases use a scratch collection of 400 × 5 KB files.
 
 | scenario | p50 | p90 |
 |---|---:|---:|
-| prompt hook (pull `memory`, nothing new) | 432 ms | 622 ms |
-| full pull, 5 collections (SessionStart) | 503 ms | 1190 ms |
-| push, nothing changed | 21 ms | 25 ms |
-| push 1 file | 915 ms | 1821 ms |
-| pull 1 file | 764 ms | 1105 ms |
-| push 20 files | 1023 ms | 2130 ms |
-| pull 20 files | 1040 ms | 3971 ms |
-| first push, 400 files | 9.5 s | |
-| first pull, 400 files | 7.6 s | |
+| prompt hook (pull `memory`, nothing new) | 327 ms | 396 ms |
+| full pull, 5 collections (SessionStart) | 413 ms | 518 ms |
+| push, nothing changed | 23 ms | 27 ms |
+| push 1 file | 649 ms | 709 ms |
+| pull 1 file | 395 ms | 527 ms |
+| push 20 files | 879 ms | 1407 ms |
+| pull 20 files | 580 ms | 1303 ms |
+| first push, 400 files | 8.6 s | |
+| first pull, 400 files | 5.3 s | |
 
-A quiet prompt costs one round trip to R2; local work is ~3 ms. Push hooks run async, so they
+A quiet prompt costs one round trip to R2; local work is ~3 ms. Pulling a small change is one
+round trip too: new content rides inline in the manifest. Push hooks run async, so they
 never delay Claude.
 
 [CONTRIBUTING](CONTRIBUTING.md) · [SECURITY](SECURITY.md) · [MIT](LICENSE)

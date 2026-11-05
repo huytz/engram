@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+## 0.1.3 — 2026-11-05
+
+- Prompt hook reuses the device list for `device_list_ttl` seconds (default 600) instead of a
+  LIST per prompt; SessionStart and `engram pull` still LIST. Prompt hook p50 349 → 327 ms.
+- Manifests carry the content of blobs new in that push (`inline`, up to 256 KB), so a reader
+  that is caught up skips the blob GET: pull 1 file 544 → 395 ms, pull 20 files 896 → 580 ms.
+  Inlined blobs are PUT alongside the manifest: push 1 file 780 → 649 ms. Blobs are still
+  uploaded, so readers further behind and v0.1.2 fall back to blob GETs.
+
 ## 0.1.2 — 2026-11-05
 
 - Pull fetches all collections and devices concurrently; the device LIST runs alongside the
