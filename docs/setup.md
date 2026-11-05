@@ -65,4 +65,6 @@ the free tier: **$0**.
 - Hooks show their timing in Claude Code; set `"hook_timing": false` in `config.json` to hide it.
 - The prompt hook reuses the device list for `"device_list_ttl"` seconds (default 600), so a new
   device shows up at the next session start or within 10 minutes; `0` LISTs on every prompt.
+- `"background_pull": true` (default) makes the prompt hook start the pull in a detached process
+  and return; its results (`~/.engram/inbox/`) reach Claude on the next prompt. `false` waits for it.
 - TLS roots are read from the OS once a day into `~/.engram/roots.pem`; delete it after adding a CA.

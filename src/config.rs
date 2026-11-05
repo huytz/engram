@@ -30,6 +30,9 @@ pub struct Config {
     /// Seconds the prompt hook reuses the device list before a new LIST
     #[serde(default = "list_ttl")]
     pub device_list_ttl: u64,
+    /// Prompt hook pulls in the background; results reach the next prompt
+    #[serde(default = "yes")]
+    pub background_pull: bool,
 }
 
 fn yes() -> bool {

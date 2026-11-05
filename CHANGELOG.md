@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+## 0.1.4 — 2026-11-05
+
+- Prompt hook pulls in a detached background process (`"background_pull"`, default on) and
+  returns right away: 327 ms → <1 ms of engram work (process start ~14 ms). Results go to
+  `~/.engram/inbox/` and reach Claude on the next prompt; files land on disk ~0.3 s after the
+  prompt. SessionStart still pulls synchronously.
+
 ## 0.1.3 — 2026-11-05
 
 - Prompt hook reuses the device list for `device_list_ttl` seconds (default 600) instead of a

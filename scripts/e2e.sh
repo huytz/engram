@@ -20,6 +20,9 @@ fail() { echo "FAIL: $*" >&2; exit 1; }
 a init --device dev-a --remote "file://$T/remote" --import "$T/seed-a" --no-skills >/dev/null
 cp "$T/a/identity.txt" "$T/b/"
 b init --device dev-b --remote "file://$T/remote" --import "$T/seed-b" --no-skills >/dev/null
+# Cases 1-7 check the synchronous prompt hook; case 8 covers background pull
+sync_mode() { sed -i.bak 's/"background_pull": *true/"background_pull": false/' "$1/config.json" && rm "$1/config.json.bak"; }
+sync_mode "$T/a"; sync_mode "$T/b"
 
 # 1. both devices converge to one index
 a pull >/dev/null; a push >/dev/null; b pull >/dev/null
@@ -79,7 +82,16 @@ echo "lag 2" > "$T/b/memory/lag2.md"; b push >/dev/null
 a pull >/dev/null; [ "$(cat "$T/a/memory/lag1.md")" = "lag 1" ] || fail "lagging reader missed blob"
 grep -q '"inline"' "$T/b/state.json" && fail "inline content leaked into state"
 
-# 8. wrong identity fails cleanly
+# 8. background pull: hook returns at once, results on the next prompt
+sed -i.bak 's/"background_pull": *false/"background_pull": true/' "$T/a/config.json" && rm "$T/a/config.json.bak"
+echo "bg body" > "$T/b/memory/bg.md"; echo '- [bg W](bg.md) — b w' >> "$T/b/memory/MEMORY.md"; b push >/dev/null
+a hook userpromptsubmit | grep -q 'bg W' && fail "bg mode must not block on the pull"
+for _ in $(seq 50); do [ -n "$(ls "$T/a/inbox/" 2>/dev/null | grep json)" ] && break; sleep 0.1; done
+[ "$(cat "$T/a/memory/bg.md")" = "bg body" ] || fail "background pull did not land the file"
+a hook userpromptsubmit | grep -q 'bg W' || fail "next prompt did not surface bg index line"
+for _ in $(seq 50); do [ ! -e "$T/a/lock" ] && break; sleep 0.1; done
+
+# 9. wrong identity fails cleanly
 mkdir -p "$T/x"; sed 's/dev-a/intruder/' "$T/a/config.json" > "$T/x/config.json"
 { ENGRAM_HOME="$T/x" "$BIN" pull 2>&1 || true; } | grep -q "wrong identity" || fail "wrong identity should be rejected"
 

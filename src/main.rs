@@ -441,6 +441,7 @@ async fn init(
         collections,
         hook_timing: true,
         device_list_ttl: 600,
+        background_pull: true,
     };
     cfg.save()?;
     let keys = Keys::load_or_create()?;
@@ -490,6 +491,76 @@ fn default_project_memory() -> Option<std::path::PathBuf> {
     dir.is_dir().then_some(dir)
 }
 
+/// Per-prompt pull of `memory` only, skipping when a push holds the lock
+async fn prompt_pull(cfg: &Config, out: &mut Out) -> Result<()> {
+    // Busy = a push is running; skip this prompt instead of stalling it
+    let Ok(_lock) = Lock::acquire_within(10) else {
+        out.timing.push("skipped, push in progress".into());
+        return Ok(());
+    };
+    // Only memory surfaces index lines mid-session; other collections wait for SessionStart
+    let only = cfg.collection("memory").map(|c| c.name.as_str());
+    do_pull(cfg, only, true, out).await
+}
+
+fn inbox_dir() -> std::path::PathBuf {
+    home().join("inbox")
+}
+
+/// Drain results left by background pulls, oldest first
+fn inbox_take(out: &mut Out) {
+    let Ok(rd) = std::fs::read_dir(inbox_dir()) else {
+        return;
+    };
+    let mut files: Vec<_> = rd
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.extension().is_some_and(|x| x == "json"))
+        .collect();
+    files.sort();
+    for f in files {
+        let got = std::fs::read(&f)
+            .ok()
+            .and_then(|d| serde_json::from_slice::<(Vec<String>, Vec<String>)>(&d).ok());
+        let _ = std::fs::remove_file(&f);
+        if let Some((lines, timing)) = got {
+            out.lines.extend(lines);
+            out.timing
+                .extend(timing.into_iter().map(|t| format!("bg {t}")));
+        }
+    }
+}
+
+/// One file per background run: writers never touch each other's results
+fn inbox_put(out: &Out) -> Result<()> {
+    if out.lines.is_empty() && out.timing.is_empty() {
+        return Ok(());
+    }
+    let dir = inbox_dir();
+    std::fs::create_dir_all(&dir)?;
+    let name = format!(
+        "{}-{}",
+        chrono::Utc::now().format("%Y%m%dT%H%M%S%.6f"),
+        std::process::id()
+    );
+    let tmp = dir.join(format!("{name}.tmp"));
+    std::fs::write(&tmp, serde_json::to_vec(&(&out.lines, &out.timing))?)?;
+    std::fs::rename(&tmp, dir.join(format!("{name}.json")))?;
+    Ok(())
+}
+
+/// Detached `engram hook prompt-bg`: own pgroup, no stdio, hook returns now
+fn spawn_bg() -> Result<()> {
+    use std::os::unix::process::CommandExt;
+    std::process::Command::new(std::env::current_exe()?)
+        .args(["hook", "prompt-bg"])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .process_group(0)
+        .spawn()?;
+    Ok(())
+}
+
 /// Run one hook event; fills `out` and returns the action label for the status line
 async fn hook(
     event: &str,
@@ -497,16 +568,22 @@ async fn hook(
     out: &mut Out,
     t: &mut std::time::Instant,
 ) -> Result<&'static str> {
-    if event == "userpromptsubmit" {
-        // Busy = a push is running; skip this prompt instead of stalling it
-        let Ok(_lock) = Lock::acquire_within(10) else {
-            out.timing.push("skipped, push in progress".into());
+    match event {
+        "userpromptsubmit" if cfg.background_pull => {
+            inbox_take(out);
+            spawn_bg()?;
             return Ok("pull");
-        };
-        // Only memory surfaces index lines mid-session; other collections wait for SessionStart
-        let only = cfg.collection("memory").map(|c| c.name.as_str());
-        do_pull(cfg, only, true, out).await?;
-        return Ok("pull");
+        }
+        "userpromptsubmit" => return prompt_pull(cfg, out).await.map(|_| "pull"),
+        "prompt-bg" => {
+            if let Err(e) = prompt_pull(cfg, out).await {
+                log(&format!("hook prompt-bg failed: {e:#}"));
+                out.timing.push(format!("failed: {e:#}"));
+            }
+            inbox_put(out)?;
+            return Ok("");
+        }
+        _ => {}
     }
     let _lock = Lock::acquire()?;
     match event {
