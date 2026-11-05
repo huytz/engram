@@ -3,11 +3,16 @@ use crate::config::{Collection, Config, expand};
 use crate::crypto::{Keys, sha256_hex};
 use crate::model::{Entry, Manifest, State, now_rfc3339, now_ts};
 use anyhow::{Context, Result};
-use std::collections::{BTreeMap, HashSet};
+use futures_util::future::join_all;
+use futures_util::stream::{self, StreamExt};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
+use std::time::Instant;
 
 const TOMBSTONE_TTL: i64 = 90 * 86400;
 const INDEX: &str = "MEMORY.md";
+/// In-flight blob requests per device/collection; R2 speaks HTTP/1.1 so each is its own connection
+const PARALLEL: usize = 16;
 
 pub struct Local {
     pub sha: String,
@@ -25,6 +30,16 @@ pub struct Change {
 pub struct Report {
     pub changes: Vec<Change>,
     pub new_index_lines: Vec<String>,
+    /// Wall time of the network fetch for this collection
+    pub ms: u128,
+}
+
+/// Outcome of one collection upload
+pub struct Pushed<'c> {
+    pub col: &'c Collection,
+    pub changed: usize,
+    pub blobs: usize,
+    pub ms: u128,
 }
 
 pub struct Syncer<'a> {
@@ -122,6 +137,23 @@ fn write_file(path: &Path, data: &[u8], mtime: i64) -> Result<()> {
     Ok(())
 }
 
+/// One device's manifest plus the blobs `apply` will need, fetched before any local write
+struct Remote {
+    dev: String,
+    etag: String,
+    manifest: Manifest,
+    blobs: HashMap<String, Vec<u8>>,
+}
+
+/// Prepared upload of one collection: blobs to send, then the manifest that commits them
+struct PushPlan<'c> {
+    col: &'c Collection,
+    uploads: Vec<(String, String)>,
+    manifest: Manifest,
+    local: BTreeMap<String, Local>,
+    changed: usize,
+}
+
 impl<'a> Syncer<'a> {
     pub fn new(cfg: &'a Config, keys: &'a Keys, backend: &'a Backend) -> Result<Self> {
         Ok(Syncer {
@@ -132,12 +164,67 @@ impl<'a> Syncer<'a> {
         })
     }
 
-    /// Upload local changes of `col` under our device prefix; returns number of changed entries
-    pub async fn push(&mut self, col: &Collection) -> Result<usize> {
+    /// Upload local changes of every collection concurrently; returns (collection, changed) per success
+    pub async fn push_all<'c>(
+        &mut self,
+        cols: &[&'c Collection],
+    ) -> (Vec<Pushed<'c>>, Option<anyhow::Error>) {
+        let mut err = None;
+        let mut plans = vec![];
+        for c in cols {
+            match self.plan_push(c) {
+                Ok(Some(p)) => plans.push(p),
+                Ok(None) => {}
+                Err(e) => {
+                    err.get_or_insert(e);
+                }
+            }
+        }
+        let this = &*self;
+        let results = join_all(plans.iter().map(|p| async move {
+            let t = Instant::now();
+            (this.upload(p).await, t.elapsed().as_millis())
+        }))
+        .await;
+        let mut done = vec![];
+        for (plan, (r, ms)) in plans.into_iter().zip(results) {
+            match r {
+                Ok(()) => {
+                    done.push(Pushed {
+                        col: plan.col,
+                        changed: plan.changed,
+                        blobs: plan.uploads.len(),
+                        ms,
+                    });
+                    self.commit_push(plan);
+                }
+                Err(e) => {
+                    err.get_or_insert(e);
+                }
+            }
+        }
+        if !done.is_empty()
+            && let Err(e) = self.state.save()
+        {
+            err.get_or_insert(e);
+        }
+        (done, err)
+    }
+
+    /// Diff `col` against our last manifest; None when nothing changed
+    fn plan_push<'c>(&self, col: &'c Collection) -> Result<Option<PushPlan<'c>>> {
         let dev = &self.cfg.device;
-        let own = self.state.own.get(&col.name).cloned().unwrap_or_default();
-        let local = scan_since(col, Some(&own))?;
+        let empty = Manifest::default();
+        let own = self.state.own.get(&col.name).unwrap_or(&empty);
+        let local = scan_since(col, Some(own))?;
+        // Blobs are content-addressed per device: a sha in our last manifest is already uploaded
+        let mut have: HashSet<&str> = own
+            .files
+            .values()
+            .filter_map(|e| e.sha.as_deref())
+            .collect();
         let mut files: BTreeMap<String, Entry> = BTreeMap::new();
+        let mut uploads = vec![];
         let mut changed = 0usize;
         let now = now_ts();
 
@@ -145,10 +232,8 @@ impl<'a> Syncer<'a> {
             let prev = own.files.get(rel);
             if prev.and_then(|p| p.sha.as_deref()) != Some(l.sha.as_str()) {
                 changed += 1;
-                let key = blob_key(&col.name, dev, &l.sha);
-                if !self.backend.exists(&key).await? {
-                    let data = std::fs::read(expand(&col.path).join(rel))?;
-                    self.backend.put(&key, self.keys.encrypt(&data)?).await?;
+                if have.insert(l.sha.as_str()) {
+                    uploads.push((rel.clone(), l.sha.clone()));
                 }
             }
             files.insert(
@@ -189,121 +274,238 @@ impl<'a> Syncer<'a> {
             }
         }
         if changed == 0 && own.seq > 0 {
-            return Ok(0);
+            return Ok(None);
         }
-        let m = Manifest {
+        let manifest = Manifest {
             device: dev.clone(),
             seq: own.seq + 1,
             updated_at: now_rfc3339(),
             files,
         };
-        let body = self.keys.encrypt(serde_json::to_vec(&m)?.as_slice())?;
-        self.backend
-            .put(&manifest_key(&col.name, dev), body)
-            .await?;
-        let applied = self.state.applied.entry(col.name.clone()).or_default();
-        for (rel, l) in &local {
-            applied.insert(rel.clone(), l.sha.clone());
-        }
-        applied.retain(|k, _| local.contains_key(k));
-        self.state.own.insert(col.name.clone(), m);
-        self.state.save()?;
-        Ok(changed)
+        Ok(Some(PushPlan {
+            col,
+            uploads,
+            manifest,
+            local,
+            changed,
+        }))
     }
 
-    /// Merge other devices' manifests into the local directory of `col`
-    pub async fn pull(&mut self, col: &Collection) -> Result<Report> {
+    /// PUT new blobs in parallel, then the manifest; PUT is idempotent so no HEAD probe first
+    async fn upload(&self, plan: &PushPlan<'_>) -> Result<()> {
+        let (col, dev) = (&plan.col.name, &self.cfg.device);
+        let root = expand(&plan.col.path);
+        let mut puts = stream::iter(plan.uploads.iter().map(|(rel, sha)| {
+            let path = root.join(rel);
+            async move {
+                let data = std::fs::read(&path).with_context(|| format!("read {rel}"))?;
+                self.backend
+                    .put(&blob_key(col, dev, sha), self.keys.encrypt(&data)?)
+                    .await
+            }
+        }))
+        .buffer_unordered(PARALLEL);
+        while let Some(r) = puts.next().await {
+            r?;
+        }
+        let body = self.keys.encrypt(&serde_json::to_vec(&plan.manifest)?)?;
+        self.backend.put(&manifest_key(col, dev), body).await
+    }
+
+    fn commit_push(&mut self, plan: PushPlan<'_>) {
+        let name = &plan.col.name;
+        let applied = self.state.applied.entry(name.clone()).or_default();
+        for (rel, l) in &plan.local {
+            applied.insert(rel.clone(), l.sha.clone());
+        }
+        applied.retain(|k, _| plan.local.contains_key(k));
+        self.state.own.insert(name.clone(), plan.manifest);
+    }
+
+    /// Fetch every collection concurrently, then merge sequentially; one result per collection
+    pub async fn pull_all<'c>(
+        &mut self,
+        cols: &[&'c Collection],
+    ) -> Vec<(&'c Collection, Result<Report>)> {
+        let this = &*self;
+        let fetched = join_all(cols.iter().map(|c| async move {
+            let t = Instant::now();
+            (this.fetch_col(c).await, t.elapsed().as_millis())
+        }))
+        .await;
+        let mut out = vec![];
+        let mut dirty = false;
+        for (col, (f, ms)) in cols.iter().zip(fetched) {
+            let r = f.and_then(|remotes| {
+                dirty |= !remotes.is_empty();
+                self.apply_col(col, remotes)
+            });
+            let r = r.map(|mut r| {
+                r.ms = ms;
+                r
+            });
+            out.push((*col, r));
+        }
+        if dirty && let Err(e) = self.state.save() {
+            out.push((cols[0], Err(e)));
+        }
+        out
+    }
+
+    fn apply_col(&mut self, col: &Collection, remotes: Vec<Remote>) -> Result<Report> {
         let root = expand(&col.path);
         let mut report = Report {
             changes: vec![],
             new_index_lines: vec![],
+            ms: 0,
         };
+        if remotes.is_empty() {
+            return Ok(report);
+        }
         let index_before = std::fs::read_to_string(root.join(INDEX)).unwrap_or_default();
-
-        // Device prefixes only; listing every blob key made each prompt take seconds
-        let mut devices: Vec<String> = self
-            .backend
-            .list_children(&format!("{}/", col.name))
-            .await?
-            .into_iter()
-            .filter(|d| d != &self.cfg.device)
-            .collect();
-        devices.sort();
-        devices.dedup();
-
-        for dev in devices {
-            let ds = self
-                .state
-                .devices
-                .get(&col.name)
-                .and_then(|m| m.get(&dev))
-                .cloned()
-                .unwrap_or_default();
-            let etag = (!ds.etag.is_empty()).then_some(ds.etag.as_str());
-            let (data, new_etag) = match self
-                .backend
-                .get(&manifest_key(&col.name, &dev), etag)
-                .await?
-            {
-                Fetched::NotModified | Fetched::Missing => continue,
-                Fetched::Found { data, etag } => (data, etag),
-            };
-            let m: Manifest =
-                serde_json::from_slice(&self.keys.decrypt(&data)?).context("manifest json")?;
-            self.apply(col, &root, &dev, &m, &mut report).await?;
+        for r in remotes {
+            self.apply(col, &root, &r, &mut report)?;
             self.state
                 .devices
                 .entry(col.name.clone())
                 .or_default()
                 .insert(
-                    dev.clone(),
+                    r.dev.clone(),
                     crate::model::DevState {
-                        etag: new_etag,
-                        seq: m.seq,
+                        etag: r.etag,
+                        seq: r.manifest.seq,
                     },
                 );
-            self.state.save()?;
         }
-
         let index_after = std::fs::read_to_string(root.join(INDEX)).unwrap_or_default();
         report.new_index_lines = crate::memorymd::new_lines(&index_before, &index_after);
         Ok(report)
     }
 
-    async fn fetch_blob(&self, col: &str, dev: &str, sha: &str) -> Result<Vec<u8>> {
-        match self.backend.get(&blob_key(col, dev, sha), None).await? {
-            Fetched::Found { data, .. } => self.keys.decrypt(&data),
-            _ => anyhow::bail!("blob {sha} missing on {dev}"),
+    /// LIST runs alongside the GETs for already-known devices, so a quiet pull costs one round trip
+    async fn fetch_col(&self, col: &Collection) -> Result<Vec<Remote>> {
+        let me = self.cfg.device.as_str();
+        let known: Vec<String> = self
+            .state
+            .devices
+            .get(&col.name)
+            .into_iter()
+            .flat_map(|m| m.keys().cloned())
+            .filter(|d| d != me)
+            .collect();
+        let prefix = format!("{}/", col.name);
+        let (listed, known_res) = tokio::join!(
+            self.backend.list_children(&prefix),
+            join_all(known.iter().map(|d| self.fetch_dev(col, d)))
+        );
+        let mut fresh: Vec<String> = listed?
+            .into_iter()
+            .filter(|d| d != me && !known.contains(d))
+            .collect();
+        fresh.sort();
+        fresh.dedup();
+        let fresh_res = join_all(fresh.iter().map(|d| self.fetch_dev(col, d))).await;
+        let mut out = vec![];
+        for r in known_res.into_iter().chain(fresh_res) {
+            out.extend(r?);
         }
+        out.sort_by(|a, b| a.dev.cmp(&b.dev));
+        Ok(out)
     }
 
-    async fn apply(
+    /// Conditional GET of a device manifest plus a parallel fetch of the blobs it will need
+    async fn fetch_dev(&self, col: &Collection, dev: &str) -> Result<Option<Remote>> {
+        let etag = self
+            .state
+            .devices
+            .get(&col.name)
+            .and_then(|m| m.get(dev))
+            .map(|d| d.etag.as_str())
+            .filter(|e| !e.is_empty());
+        let (data, etag) = match self
+            .backend
+            .get(&manifest_key(&col.name, dev), etag)
+            .await?
+        {
+            Fetched::NotModified | Fetched::Missing => return Ok(None),
+            Fetched::Found { data, etag } => (data, etag),
+        };
+        let manifest: Manifest =
+            serde_json::from_slice(&self.keys.decrypt(&data)?).context("manifest json")?;
+        let root = expand(&col.path);
+        let mut need: Vec<String> = manifest
+            .files
+            .iter()
+            .filter(|(rel, e)| !excluded(rel, col) && self.unseen(&col.name, dev, rel, e))
+            .filter_map(|(rel, e)| {
+                let sha = e.sha.as_deref()?;
+                let same = rel.as_str() != INDEX
+                    && std::fs::read(root.join(rel))
+                        .ok()
+                        .map(|d| sha256_hex(&d))
+                        .as_deref()
+                        == Some(sha);
+                (!same).then(|| sha.to_string())
+            })
+            .collect();
+        need.sort_unstable();
+        need.dedup();
+        let mut blobs = HashMap::new();
+        let mut gets = stream::iter(need.into_iter().map(|sha| async move {
+            match self
+                .backend
+                .get(&blob_key(&col.name, dev, &sha), None)
+                .await?
+            {
+                Fetched::Found { data, .. } => Ok((sha.clone(), self.keys.decrypt(&data)?)),
+                _ => anyhow::bail!("blob {sha} missing on {dev}"),
+            }
+        }))
+        .buffer_unordered(PARALLEL);
+        while let Some(r) = gets.next().await {
+            let (sha, data) = r?;
+            blobs.insert(sha, data);
+        }
+        Ok(Some(Remote {
+            dev: dev.to_string(),
+            etag,
+            manifest,
+            blobs,
+        }))
+    }
+
+    fn unseen(&self, col: &str, dev: &str, rel: &str, e: &Entry) -> bool {
+        let seen = self
+            .state
+            .seen
+            .get(col)
+            .and_then(|d| d.get(dev))
+            .and_then(|p| p.get(rel));
+        seen.map(String::as_str) != Some(e.key().as_str())
+    }
+
+    fn apply(
         &mut self,
         col: &Collection,
         root: &Path,
-        dev: &str,
-        m: &Manifest,
+        r: &Remote,
         report: &mut Report,
     ) -> Result<()> {
+        let (dev, m) = (r.dev.as_str(), &r.manifest);
+        let blob = |sha: &str| -> Result<&Vec<u8>> {
+            r.blobs
+                .get(sha)
+                .ok_or_else(|| anyhow::anyhow!("blob {sha} missing on {dev}"))
+        };
         let cname = col.name.clone();
         let mut index_remote: Option<(Entry, String)> = None;
         let mut pulled_files: HashSet<String> = HashSet::new();
 
         for (rel, e) in &m.files {
-            if excluded(rel, col) {
+            if excluded(rel, col) || !self.unseen(&cname, dev, rel, e) {
                 continue;
             }
             let ekey = e.key();
-            let seen = self
-                .state
-                .seen
-                .get(&cname)
-                .and_then(|d| d.get(dev))
-                .and_then(|p| p.get(rel))
-                .cloned();
-            if seen.as_deref() == Some(ekey.as_str()) {
-                continue;
-            }
             if rel == INDEX {
                 index_remote = Some((e.clone(), ekey));
                 continue;
@@ -343,9 +545,9 @@ impl<'a> Syncer<'a> {
                         .insert(rel.clone(), rsha.clone());
                 }
                 Some(rsha) => {
-                    let data = self.fetch_blob(&cname, dev, rsha).await?;
+                    let data = blob(rsha)?;
                     if unchanged {
-                        write_file(&path, &data, e.mtime)?;
+                        write_file(&path, data, e.mtime)?;
                         self.state
                             .applied
                             .entry(cname.clone())
@@ -373,10 +575,10 @@ impl<'a> Syncer<'a> {
                             conflict_name(rel, if remote_wins { &self.cfg.device } else { dev });
                         if remote_wins {
                             std::fs::rename(&path, root.join(&loser))?;
-                            write_file(&path, &data, e.mtime)?;
+                            write_file(&path, data, e.mtime)?;
                             pulled_files.insert(rel.clone());
                         } else {
-                            write_file(&root.join(&loser), &data, e.mtime)?;
+                            write_file(&root.join(&loser), data, e.mtime)?;
                         }
                         let now_sha = sha256_hex(&std::fs::read(&path)?);
                         self.state
@@ -404,8 +606,7 @@ impl<'a> Syncer<'a> {
         if let Some((e, ekey)) = index_remote {
             if let Some(rsha) = &e.sha {
                 let path = root.join(INDEX);
-                let remote =
-                    String::from_utf8_lossy(&self.fetch_blob(&cname, dev, rsha).await?).to_string();
+                let remote = String::from_utf8_lossy(blob(rsha)?).to_string();
                 let local = std::fs::read_to_string(&path).unwrap_or_default();
                 let applied = self
                     .state

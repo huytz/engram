@@ -166,16 +166,31 @@ async fn open(cfg: &Config) -> Result<(Keys, Backend)> {
     Ok((Keys::load_or_create()?, Backend::open(cfg).await?))
 }
 
-async fn do_pull(cfg: &Config, only: Option<&str>, quiet_if_empty: bool) -> Result<()> {
+/// What a pull/push wants to say: lines for Claude/the terminal, timing parts for the hook status line
+#[derive(Default)]
+struct Out {
+    lines: Vec<String>,
+    timing: Vec<String>,
+}
+
+async fn do_pull(cfg: &Config, only: Option<&str>, out: &mut Out) -> Result<()> {
     let (keys, be) = open(cfg).await?;
     let mut s = Syncer::new(cfg, &keys, &be)?;
-    let mut any = false;
-    for c in cols(cfg, only) {
-        let r = s.pull(c).await?;
-        if r.changes.is_empty() {
-            continue;
-        }
-        any = true;
+    let mut err = None;
+    for (c, r) in s.pull_all(&cols(cfg, only)).await {
+        let r = match r {
+            Ok(r) => r,
+            Err(e) => {
+                out.timing.push(format!("{} failed", c.name));
+                err.get_or_insert(e.context(format!("pull {}", c.name)));
+                continue;
+            }
+        };
+        let what = match r.changes.len() {
+            0 => "up to date".to_string(),
+            n => format!("{n} file(s)"),
+        };
+        out.timing.push(format!("{} {}ms ({what})", c.name, r.ms));
         let mut by_dev: std::collections::BTreeMap<&str, usize> = Default::default();
         for ch in &r.changes {
             *by_dev.entry(ch.device.as_str()).or_default() += 1;
@@ -185,45 +200,78 @@ async fn do_pull(cfg: &Config, only: Option<&str>, quiet_if_empty: bool) -> Resu
             ));
         }
         for (d, n) in by_dev {
-            println!("engram: pulled {n} {} file(s) from {d}", c.name);
+            out.lines
+                .push(format!("engram: pulled {n} {} file(s) from {d}", c.name));
         }
         for ch in r.changes.iter().filter(|c| c.kind == "conflict") {
-            println!("engram: CONFLICT {}", ch.path);
+            out.lines.push(format!("engram: CONFLICT {}", ch.path));
         }
         if !r.new_index_lines.is_empty() {
-            println!("engram: new memory index entries from other devices:");
-            for l in r.new_index_lines {
-                println!("{l}");
-            }
+            out.lines
+                .push("engram: new memory index entries from other devices:".into());
+            out.lines.extend(r.new_index_lines);
         }
     }
-    if !any && !quiet_if_empty {
-        println!("engram: up to date");
-    }
-    Ok(())
+    err.map_or(Ok(()), Err)
 }
 
-async fn do_push(cfg: &Config, only: Option<&str>, quiet: bool) -> Result<()> {
+async fn do_push(cfg: &Config, only: Option<&str>, out: &mut Out) -> Result<()> {
     let (keys, be) = open(cfg).await?;
     let mut s = Syncer::new(cfg, &keys, &be)?;
-    for c in cols(cfg, only) {
-        let n = s.push(c).await?;
-        if n > 0 {
-            log(&format!("push {} {n} change(s)", c.name));
-            if !quiet {
-                println!("engram: pushed {n} {} change(s)", c.name);
-            }
-        }
+    let plugins_sha = s.state.plugins_sha.clone();
+    // Plugin list upload overlaps the collection uploads instead of trailing them
+    let plugins = async {
+        let t = std::time::Instant::now();
+        let r = match only {
+            None => plugins::publish(&be, &keys, &cfg.device, plugins_sha.as_deref()).await,
+            Some(_) => Ok(None),
+        };
+        (r, t.elapsed().as_millis())
+    };
+    let targets = cols(cfg, only);
+    let ((done, err), (plugins, plugins_ms)) = tokio::join!(s.push_all(&targets), plugins);
+    for p in done {
+        log(&format!("push {} {} change(s)", p.col.name, p.changed));
+        out.lines.push(format!(
+            "engram: pushed {} {} change(s)",
+            p.changed, p.col.name
+        ));
+        out.timing.push(format!(
+            "{} {}ms ({} change(s), {} blob(s))",
+            p.col.name, p.ms, p.changed, p.blobs
+        ));
     }
-    if only.is_none()
-        && let Some(sha) =
-            plugins::publish(&be, &keys, &cfg.device, s.state.plugins_sha.as_deref()).await?
-    {
+    if let Some(sha) = plugins? {
         s.state.plugins_sha = Some(sha);
         s.state.save()?;
         log("push plugin list");
+        out.timing.push(format!("plugins {plugins_ms}ms"));
     }
-    Ok(())
+    err.map_or(Ok(()), Err)
+}
+
+/// CLI flavour: print pull lines, or "up to date" when nothing came in
+async fn cli_pull(cfg: &Config, only: Option<&str>) -> Result<()> {
+    let mut out = Out::default();
+    let r = do_pull(cfg, only, &mut out).await;
+    print_lines(&out.lines, "engram: up to date");
+    r
+}
+
+async fn cli_push(cfg: &Config, only: Option<&str>) -> Result<()> {
+    let mut out = Out::default();
+    let r = do_push(cfg, only, &mut out).await;
+    print_lines(&out.lines, "");
+    r
+}
+
+fn print_lines(lines: &[String], empty: &str) {
+    if lines.is_empty() && !empty.is_empty() {
+        println!("{empty}");
+    }
+    for l in lines {
+        println!("{l}");
+    }
 }
 
 async fn plugins_diff(cfg: &Config) -> Result<()> {
@@ -390,6 +438,7 @@ async fn init(
         access_key_id: access_key,
         secret_access_key: secret_key,
         collections,
+        hook_timing: true,
     };
     cfg.save()?;
     let keys = Keys::load_or_create()?;
@@ -415,8 +464,8 @@ async fn init(
         }
         println!("imported {n} file(s) from {}", src.display());
     }
-    do_pull(&cfg, None, false).await?;
-    do_push(&cfg, None, false).await?;
+    cli_pull(&cfg, None).await?;
+    cli_push(&cfg, None).await?;
     println!(
         "done. next: `engram install-hooks`, then copy identity.txt + config.json to other devices"
     );
@@ -439,37 +488,75 @@ fn default_project_memory() -> Option<std::path::PathBuf> {
     dir.is_dir().then_some(dir)
 }
 
-async fn hook(event: &str) -> Result<()> {
-    let cfg = Config::load()?;
+/// Run one hook event; fills `out` and returns the action label for the status line
+async fn hook(
+    event: &str,
+    cfg: &Config,
+    out: &mut Out,
+    t: &mut std::time::Instant,
+) -> Result<&'static str> {
     if event == "userpromptsubmit" {
         // Busy = a push is running; skip this prompt instead of stalling it
         let Ok(_lock) = Lock::acquire_within(10) else {
-            return Ok(());
+            out.timing.push("skipped, push in progress".into());
+            return Ok("pull");
         };
         // Only memory surfaces index lines mid-session; other collections wait for SessionStart
         let only = cfg.collection("memory").map(|c| c.name.as_str());
-        return do_pull(&cfg, only, true).await;
+        do_pull(cfg, only, out).await?;
+        return Ok("pull");
     }
     let _lock = Lock::acquire()?;
     match event {
-        "sessionstart" => do_pull(&cfg, None, true).await,
+        "sessionstart" => do_pull(cfg, None, out).await.map(|_| "pull"),
         "posttooluse" => {
             let Some(fp) = hooks::stdin_file_path() else {
-                return Ok(());
+                return Ok("");
             };
             let Some(col) = cfg.collection_for(&fp) else {
-                return Ok(());
+                return Ok("");
             };
             // Let a Write+Edit pair land in one manifest
             tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
-            do_push(&cfg, Some(&col.name), true).await
+            *t = std::time::Instant::now();
+            do_push(cfg, Some(&col.name), out).await.map(|_| "push")
         }
-        "stop" => do_push(&cfg, None, true).await,
+        "stop" => do_push(cfg, None, out).await.map(|_| "push"),
         other => bail!("unknown hook event {other}"),
     }
 }
 
-#[tokio::main]
+/// Hook stdout as Claude Code JSON: `systemMessage` shows timings to the user, `additionalContext` feeds Claude
+fn hook_output(event: &str, cfg: &Config, action: &str, ms: u128, out: &Out) -> Option<String> {
+    let mut v = serde_json::Map::new();
+    if cfg.hook_timing && !action.is_empty() {
+        let mut msg = format!("engram {action} {ms}ms");
+        if out.timing.is_empty() {
+            msg.push_str(" · no change");
+        }
+        for t in &out.timing {
+            msg.push_str(" · ");
+            msg.push_str(t);
+        }
+        v.insert("systemMessage".into(), msg.into());
+    }
+    let name = match event {
+        "userpromptsubmit" => Some("UserPromptSubmit"),
+        "sessionstart" => Some("SessionStart"),
+        _ => None,
+    };
+    if let Some(name) = name
+        && !out.lines.is_empty()
+    {
+        v.insert(
+            "hookSpecificOutput".into(),
+            serde_json::json!({ "hookEventName": name, "additionalContext": out.lines.join("\n") }),
+        );
+    }
+    (!v.is_empty()).then(|| serde_json::Value::Object(v).to_string())
+}
+
+#[tokio::main(flavor = "current_thread")]
 async fn main() {
     let cli = Cli::parse();
     let res = match cli.cmd {
@@ -488,7 +575,7 @@ async fn main() {
             .await
         }
         Cmd::Pull { collection } => {
-            async { do_pull(&Config::load()?, collection.as_deref(), false).await }.await
+            async { cli_pull(&Config::load()?, collection.as_deref()).await }.await
         }
         Cmd::Push {
             collection,
@@ -503,15 +590,15 @@ async fn main() {
                     },
                     None => collection,
                 };
-                do_push(&cfg, only.as_deref(), false).await
+                cli_push(&cfg, only.as_deref()).await
             }
             .await
         }
         Cmd::Sync => {
             async {
                 let cfg = Config::load()?;
-                do_pull(&cfg, None, false).await?;
-                do_push(&cfg, None, false).await
+                cli_pull(&cfg, None).await?;
+                cli_push(&cfg, None).await
             }
             .await
         }
@@ -526,9 +613,26 @@ async fn main() {
         Cmd::Collection { cmd } => collection_cmd(cmd),
         Cmd::Plugins => async { plugins_diff(&Config::load()?).await }.await,
         Cmd::Hook { event } => {
-            // Hooks never block Claude: log and exit 0
-            if let Err(e) = hook(&event).await {
-                log(&format!("hook {event} failed: {e:#}"));
+            // Hooks never block Claude: log, report, exit 0
+            let mut t = std::time::Instant::now();
+            let mut out = Out::default();
+            match Config::load() {
+                Ok(cfg) => {
+                    let action = match hook(&event, &cfg, &mut out, &mut t).await {
+                        Ok(a) => a,
+                        Err(e) => {
+                            log(&format!("hook {event} failed: {e:#}"));
+                            out.timing.push(format!("failed: {e:#}"));
+                            "hook"
+                        }
+                    };
+                    if let Some(j) =
+                        hook_output(&event, &cfg, action, t.elapsed().as_millis(), &out)
+                    {
+                        println!("{j}");
+                    }
+                }
+                Err(e) => log(&format!("hook {event} failed: {e:#}")),
             }
             Ok(())
         }

@@ -1201,17 +1201,23 @@ dependencies = [
 
 [[package]]
 name = "engram"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "age",
  "anyhow",
  "aws-config",
  "aws-credential-types",
  "aws-sdk-s3",
+ "aws-smithy-http-client",
+ "base64 0.22.1",
  "chrono",
  "clap",
  "dirs",
+ "futures-util",
  "hex",
+ "rustls 0.23.46",
+ "rustls-native-certs",
+ "rustls-pki-types",
  "serde",
  "serde_json",
  "sha2 0.11.1",

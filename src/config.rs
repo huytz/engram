@@ -24,6 +24,13 @@ pub struct Config {
     #[serde(default)]
     pub secret_access_key: Option<String>,
     pub collections: Vec<Collection>,
+    /// Show per-hook timings in Claude Code (`systemMessage`)
+    #[serde(default = "yes")]
+    pub hook_timing: bool,
+}
+
+fn yes() -> bool {
+    true
 }
 
 /// `$ENGRAM_HOME` or `~/.engram`

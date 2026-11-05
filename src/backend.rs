@@ -4,7 +4,52 @@ use aws_sdk_s3::config::{
     Credentials, Region, RequestChecksumCalculation, ResponseChecksumValidation,
 };
 use aws_sdk_s3::error::SdkError;
+use aws_smithy_http_client::tls;
+use base64::Engine;
+use rustls_pki_types::CertificateDer;
+use rustls_pki_types::pem::PemObject;
 use std::path::PathBuf;
+
+const ROOTS_TTL: std::time::Duration = std::time::Duration::from_secs(86400);
+
+/// Native roots cached as PEM for a day: reading the macOS keychain costs ~70ms per run
+fn trust_store() -> tls::TrustStore {
+    let p = crate::config::home().join("roots.pem");
+    let fresh = std::fs::metadata(&p)
+        .and_then(|m| m.modified())
+        .map(|t| t.elapsed().unwrap_or_default() < ROOTS_TTL)
+        .unwrap_or(false);
+    if fresh
+        && let Ok(pem) = std::fs::read(&p)
+        && !pem.is_empty()
+        && CertificateDer::pem_slice_iter(&pem).all(|c| c.is_ok())
+    {
+        return tls::TrustStore::empty()
+            .with_native_roots(false)
+            .with_pem_certificate(pem);
+    }
+    // Keep only certs rustls accepts: the SDK panics on any cert it cannot add
+    let mut check = rustls::RootCertStore::empty();
+    let mut pem = String::new();
+    for c in rustls_native_certs::load_native_certs().certs {
+        if check.add(c.clone()).is_ok() {
+            let b64 = base64::engine::general_purpose::STANDARD.encode(c.as_ref());
+            pem.push_str("-----BEGIN CERTIFICATE-----\n");
+            for line in b64.as_bytes().chunks(64) {
+                pem.push_str(std::str::from_utf8(line).unwrap_or_default());
+                pem.push('\n');
+            }
+            pem.push_str("-----END CERTIFICATE-----\n");
+        }
+    }
+    if pem.is_empty() {
+        return tls::TrustStore::default();
+    }
+    let _ = crate::config::write_private(&p, pem.as_bytes());
+    tls::TrustStore::empty()
+        .with_native_roots(false)
+        .with_pem_certificate(pem)
+}
 
 pub enum Fetched {
     NotModified,
@@ -30,18 +75,40 @@ impl Backend {
             .ok_or_else(|| anyhow!("remote must be s3://bucket or file:///dir"))?
             .trim_end_matches('/')
             .to_string();
-        let region = cfg.region.clone().unwrap_or_else(|| "auto".into());
-        let mut loader =
-            aws_config::defaults(aws_config::BehaviorVersion::latest()).region(Region::new(region));
-        if let (Some(ak), Some(sk)) = (&cfg.access_key_id, &cfg.secret_access_key) {
-            loader = loader.credentials_provider(Credentials::new(ak, sk, None, None, "engram"));
-        }
-        if let Some(ep) = &cfg.endpoint {
-            loader = loader.endpoint_url(ep);
-        }
-        let sdk = loader.load().await;
+        let region = Region::new(cfg.region.clone().unwrap_or_else(|| "auto".into()));
         // R2 rejects the SDK's default streaming checksums
-        let s3cfg = aws_sdk_s3::config::Builder::from(&sdk)
+        let builder = match (&cfg.access_key_id, &cfg.secret_access_key, &cfg.endpoint) {
+            // Static keys + endpoint: skip the default provider chain (env, profile files, IMDS probes)
+            (Some(ak), Some(sk), Some(ep)) => aws_sdk_s3::config::Builder::new()
+                .behavior_version(aws_config::BehaviorVersion::latest())
+                .region(region)
+                .credentials_provider(Credentials::new(ak, sk, None, None, "engram"))
+                .endpoint_url(ep),
+            _ => {
+                let mut loader =
+                    aws_config::defaults(aws_config::BehaviorVersion::latest()).region(region);
+                if let (Some(ak), Some(sk)) = (&cfg.access_key_id, &cfg.secret_access_key) {
+                    loader =
+                        loader.credentials_provider(Credentials::new(ak, sk, None, None, "engram"));
+                }
+                if let Some(ep) = &cfg.endpoint {
+                    loader = loader.endpoint_url(ep);
+                }
+                aws_sdk_s3::config::Builder::from(&loader.load().await)
+            }
+        };
+        let tls = tls::TlsContext::builder()
+            .with_trust_store(trust_store())
+            .build()
+            .context("tls context")?;
+        let http = aws_smithy_http_client::Builder::new()
+            .tls_provider(tls::Provider::Rustls(
+                tls::rustls_provider::CryptoMode::AwsLc,
+            ))
+            .tls_context(tls)
+            .build_https();
+        let s3cfg = builder
+            .http_client(http)
             .request_checksum_calculation(RequestChecksumCalculation::WhenRequired)
             .response_checksum_validation(ResponseChecksumValidation::WhenRequired)
             .build();
@@ -122,19 +189,6 @@ impl Backend {
                     .await
                     .map_err(|e| anyhow!("s3 put {key}: {}", e.into_service_error()))?;
                 Ok(())
-            }
-        }
-    }
-
-    pub async fn exists(&self, key: &str) -> Result<bool> {
-        match self {
-            Backend::File { root } => Ok(root.join(key).exists()),
-            Backend::S3 { client, bucket } => {
-                match client.head_object().bucket(bucket).key(key).send().await {
-                    Ok(_) => Ok(true),
-                    Err(SdkError::ServiceError(se)) if se.err().is_not_found() => Ok(false),
-                    Err(e) => bail!("s3 head {key}: {e}"),
-                }
             }
         }
     }

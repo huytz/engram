@@ -2,6 +2,23 @@
 
 ## Unreleased
 
+## 0.1.2 — 2026-11-05
+
+- Pull fetches all collections and devices concurrently; the device LIST runs alongside the
+  conditional GETs of already-known devices, so a quiet pull is one round trip. Blobs are
+  fetched in parallel (16 in flight).
+- Push drops the per-blob HEAD (a sha already in our last manifest is already uploaded, PUT is
+  idempotent), uploads blobs in parallel and pushes collections and the plugin list together.
+- `state.json` is written once per run instead of once per device.
+- Static keys + endpoint build the S3 client directly, skipping the default provider chain;
+  single-threaded runtime.
+- OS TLS roots are cached in `~/.engram/roots.pem` for a day: reading the macOS keychain cost
+  ~70 ms on every run. Local overhead per hook ~80 ms → ~3 ms.
+- Hooks report per-action timings in Claude Code (`systemMessage`), e.g.
+  `engram pull 412ms · memory 398ms (up to date)`. Turn off with `"hook_timing": false` in
+  `config.json`. Pulled index lines now go to Claude as `additionalContext`.
+- `scripts/bench.py BIN [BIN...]` benchmarks binaries against your remote (scratch collection, removed after).
+
 ## 0.1.1 — 2026-11-04
 
 - Per-prompt pull lists only device prefixes (S3 delimiter) instead of every blob key, and pulls

@@ -31,7 +31,8 @@ echo "z body" > "$T/b/memory/new-z.md"
 echo '- [new Z](new-z.md) — b z' >> "$T/b/memory/MEMORY.md"
 echo "{\"tool_name\":\"Write\",\"tool_input\":{\"file_path\":\"$T/b/memory/new-z.md\"}}" | b hook posttooluse
 a hook userpromptsubmit | grep -q 'new Z' || fail "prompt hook did not surface new index line"
-[ -z "$(a hook userpromptsubmit)" ] || fail "second prompt hook should be silent"
+a hook userpromptsubmit | grep -q 'new Z' && fail "second prompt hook should not repeat index lines"
+a hook userpromptsubmit | grep -q '"systemMessage":"engram pull [0-9]*ms' || fail "prompt hook timing missing"
 echo '{"tool_input":{"file_path":"/etc/hosts"}}' | b hook posttooluse || fail "unrelated path must be a no-op"
 
 # 3. index line removal propagates
