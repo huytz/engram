@@ -101,7 +101,17 @@ echo "cx body" > "$T/a/memory/cx.md"; echo '- [cx V](cx.md) — a v' >> "$T/a/me
 printf '{"transcript_path":"/u/.codex/s.jsonl","tool_name":"apply_patch","tool_input":{"command":"*** Begin Patch\\n*** Add File: %s\\n+cx body\\n*** End Patch"}}' "$T/a/memory/cx.md" | a hook posttooluse >/dev/null
 b pull >/dev/null; [ "$(cat "$T/b/memory/cx.md")" = "cx body" ] || fail "codex apply_patch edit was not pushed"
 
-# 10. wrong identity fails cleanly
+# 10. before init, session start tells how to set up; init reads keys and identity from env
+mkdir -p "$T/n"
+ENGRAM_HOME="$T/n" "$BIN" hook sessionstart | grep -q '/engram:setup' || fail "unconfigured session start must point to setup"
+ENGRAM_HOME="$T/n" "$BIN" hook userpromptsubmit | grep -q . && fail "unconfigured prompt hook must stay silent"
+ENGRAM_HOME="$T/n" ENGRAM_REMOTE="file://$T/remote2" "$BIN" init --device dev-n --import "$T/seed-a" --no-skills >/dev/null || fail "env init failed"
+mkdir -p "$T/m"
+ENGRAM_HOME="$T/m" ENGRAM_REMOTE="file://$T/remote2" ENGRAM_IDENTITY="$(grep AGE-SECRET "$T/n/identity.txt")" \
+  "$BIN" init --device dev-m --import "$T/seed-b" --no-skills >/dev/null || fail "ENGRAM_IDENTITY join failed"
+[ -e "$T/m/memory/work-x.md" ] || fail "joined device did not pull the existing memory"
+
+# 11. wrong identity fails cleanly
 mkdir -p "$T/x"; sed 's/dev-a/intruder/' "$T/a/config.json" > "$T/x/config.json"
 { ENGRAM_HOME="$T/x" "$BIN" pull 2>&1 || true; } | grep -q "wrong identity" || fail "wrong identity should be rejected"
 

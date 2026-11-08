@@ -56,14 +56,14 @@ before acting on it.
 ## Operating engram
 
 `engram` is on the Bash `PATH` while the plugin is enabled in Claude Code. If the command is not
-found (for example in Codex), use `~/.engram/bin/engram-<version>`.
+found (for example in Codex), use `~/.engram/bin/engram`.
 
 | command | does |
 |---|---|
 | `engram status` | devices, sequence numbers, local pending changes |
 | `engram sync` | pull then push now |
 | `engram hook-timing on\|off` | show or hide `engram pull 412ms · …` after each hook (default off) |
-| `engram init --device <name> --remote r2://<bucket> …` | first-time setup on a device |
+| `engram init … --plugin` | first-time setup on a device: follow the `setup` skill (`/engram:setup`) |
 | `engram install-hooks --plugin` | set Claude Code `autoMemoryDirectory` and remove the old non-plugin hooks |
 
 Errors from hooks never block the agent. They go to `~/.engram/engram.log`, so read it when sync

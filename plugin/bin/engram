@@ -1,7 +1,7 @@
 #!/bin/sh
 # Runs the engram release this plugin pins; downloads and sha256-checks it on first use.
 set -eu
-VERSION=0.1.5
+VERSION=0.1.6
 REPO=huytz/engram
 home=${ENGRAM_HOME:-$HOME/.engram}
 bin=${ENGRAM_BIN:-$home/bin/engram-$VERSION}
@@ -35,5 +35,10 @@ if [ ! -x "$bin" ]; then
     [ "${1:-}" = hook ] && exit 0
     exit 1
   fi
+fi
+# Stable path for terminals, where the plugin bin dir is not on PATH
+link=$home/bin/engram
+if [ -z "${ENGRAM_BIN:-}" ] && [ "$(readlink "$link" 2>/dev/null)" != "engram-$VERSION" ]; then
+  ln -sfn "engram-$VERSION" "$link" 2>/dev/null || true
 fi
 exec "$bin" "$@"

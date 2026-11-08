@@ -34,13 +34,13 @@ enum Cmd {
         #[arg(long)]
         device: Option<String>,
         /// s3://bucket or file:///abs/dir
-        #[arg(long)]
+        #[arg(long, env = "ENGRAM_REMOTE")]
         remote: String,
-        #[arg(long)]
+        #[arg(long, env = "ENGRAM_ENDPOINT")]
         endpoint: Option<String>,
-        #[arg(long)]
+        #[arg(long, env = "ENGRAM_ACCESS_KEY", hide_env_values = true)]
         access_key: Option<String>,
-        #[arg(long)]
+        #[arg(long, env = "ENGRAM_SECRET_KEY", hide_env_values = true)]
         secret_key: Option<String>,
         /// Memory dir to copy into ~/.engram/memory (default: Claude's current project memory)
         #[arg(long)]
@@ -48,6 +48,9 @@ enum Cmd {
         /// Skip syncing ~/.claude/skills
         #[arg(long)]
         no_skills: bool,
+        /// Hooks come from the engram plugin: also set autoMemoryDirectory (= install-hooks --plugin)
+        #[arg(long)]
+        plugin: bool,
     },
     /// Fetch and merge other devices' changes
     Pull {
@@ -452,6 +455,17 @@ async fn init(
         device_list_ttl: 600,
         background_pull: true,
     };
+    // ENGRAM_IDENTITY joins an existing remote without copying identity.txt by hand
+    let id_path = home().join("identity.txt");
+    if let Ok(id) = std::env::var("ENGRAM_IDENTITY")
+        && !id_path.exists()
+    {
+        let id = id.trim();
+        if !id.starts_with("AGE-SECRET-KEY-") {
+            bail!("ENGRAM_IDENTITY must be an AGE-SECRET-KEY-… line");
+        }
+        config::write_private(&id_path, format!("{id}\n").as_bytes())?;
+    }
     cfg.save()?;
     let keys = Keys::load_or_create()?;
     println!(
@@ -479,7 +493,7 @@ async fn init(
     cli_pull(&cfg, None).await?;
     cli_push(&cfg, None).await?;
     println!(
-        "done. next: `engram install-hooks`, then copy identity.txt + config.json to other devices"
+        "done. other devices: same init with this identity (copy identity.txt or set ENGRAM_IDENTITY)"
     );
     Ok(())
 }
@@ -642,6 +656,18 @@ fn codex_memory(cfg: &Config, out: &mut Out) {
     ));
 }
 
+/// Session start before `engram init`: tell the user and the agent how to finish setup
+fn not_set_up() -> String {
+    serde_json::json!({
+        "systemMessage": "engram: not set up yet. Run /engram:setup (Codex: ask for the engram setup skill).",
+        "hookSpecificOutput": {
+            "hookEventName": "SessionStart",
+            "additionalContext": "The engram plugin is installed but not configured (no ~/.engram/config.json), so memory is not synced. If the user asks about engram, memory sync or setup, use the engram `setup` skill."
+        }
+    })
+    .to_string()
+}
+
 /// Hook stdout as Claude Code JSON: `systemMessage` shows timings to the user, `additionalContext` feeds Claude
 fn hook_output(event: &str, cfg: &Config, action: &str, ms: u128, out: &Out) -> Option<String> {
     let mut v = serde_json::Map::new();
@@ -684,12 +710,18 @@ async fn main() {
             secret_key,
             import,
             no_skills,
-        } => {
-            init(
-                device, remote, endpoint, access_key, secret_key, import, no_skills,
-            )
-            .await
-        }
+            plugin,
+        } => init(
+            device, remote, endpoint, access_key, secret_key, import, no_skills,
+        )
+        .await
+        .and_then(|_| {
+            if plugin {
+                hooks::install(&Config::load()?, true)?;
+                println!("autoMemoryDirectory set; plugin hooks start with the next session");
+            }
+            Ok(())
+        }),
         Cmd::Pull { collection } => {
             async { cli_pull(&Config::load()?, collection.as_deref()).await }.await
         }
@@ -757,6 +789,11 @@ async fn main() {
                         hook_output(&event, &cfg, action, t.elapsed().as_millis(), &out)
                     {
                         println!("{j}");
+                    }
+                }
+                Err(_) if !Config::path().exists() => {
+                    if event == "sessionstart" {
+                        println!("{}", not_set_up());
                     }
                 }
                 Err(e) => log(&format!("hook {event} failed: {e:#}")),
