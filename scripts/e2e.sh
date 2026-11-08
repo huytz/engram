@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # End-to-end check with two simulated devices and a file:// remote. Usage: scripts/e2e.sh [path/to/engram]
 set -euo pipefail
+exec </dev/null
 
 BIN=${1:-target/release/engram}
 BIN=$(cd "$(dirname "$BIN")" && pwd)/$(basename "$BIN")
@@ -23,6 +24,7 @@ b init --device dev-b --remote "file://$T/remote" --import "$T/seed-b" --no-skil
 # Cases 1-7 check the synchronous prompt hook; case 8 covers background pull
 sync_mode() { sed -i.bak 's/"background_pull": *true/"background_pull": false/' "$1/config.json" && rm "$1/config.json.bak"; }
 sync_mode "$T/a"; sync_mode "$T/b"
+a hook-timing on >/dev/null
 
 # 1. both devices converge to one index
 a pull >/dev/null; a push >/dev/null; b pull >/dev/null
@@ -91,7 +93,15 @@ for _ in $(seq 50); do [ -n "$(ls "$T/a/inbox/" 2>/dev/null | grep json)" ] && b
 a hook userpromptsubmit | grep -q 'bg W' || fail "next prompt did not surface bg index line"
 for _ in $(seq 50); do [ ! -e "$T/a/lock" ] && break; sleep 0.1; done
 
-# 9. wrong identity fails cleanly
+# 9. Codex: session start hands over MEMORY.md, apply_patch edits get pushed
+CX='{"transcript_path":"/u/.codex/sessions/x.jsonl"}'
+echo "$CX" | b hook sessionstart | grep -q '# engram memory.*rule A' || fail "codex session start missing MEMORY.md"
+echo '{"transcript_path":"/u/.claude/x.jsonl"}' | b hook sessionstart | grep -q 'engram memory' && fail "claude must not get MEMORY.md twice"
+echo "cx body" > "$T/a/memory/cx.md"; echo '- [cx V](cx.md) — a v' >> "$T/a/memory/MEMORY.md"
+printf '{"transcript_path":"/u/.codex/s.jsonl","tool_name":"apply_patch","tool_input":{"command":"*** Begin Patch\\n*** Add File: %s\\n+cx body\\n*** End Patch"}}' "$T/a/memory/cx.md" | a hook posttooluse >/dev/null
+b pull >/dev/null; [ "$(cat "$T/b/memory/cx.md")" = "cx body" ] || fail "codex apply_patch edit was not pushed"
+
+# 10. wrong identity fails cleanly
 mkdir -p "$T/x"; sed 's/dev-a/intruder/' "$T/a/config.json" > "$T/x/config.json"
 { ENGRAM_HOME="$T/x" "$BIN" pull 2>&1 || true; } | grep -q "wrong identity" || fail "wrong identity should be rejected"
 

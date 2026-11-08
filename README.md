@@ -30,10 +30,10 @@ from the same memory.
 - **Merge, never lose.** `MEMORY.md` is merged line by line; other conflicts keep the newer file
   and save the other as `name.conflict-<device>.md`. Deletions propagate.
 
-Each hook reports its cost in Claude Code, e.g. `engram pull 412ms · memory 398ms (up to date)`.
+`engram hook-timing on` makes each hook report its cost, e.g. `engram pull 412ms · memory 398ms (up to date)`.
 
-Install, setup and commands: [docs/setup.md](docs/setup.md). Unofficial; built only on documented
-Claude Code features (`autoMemoryDirectory`, hooks).
+Install as a plugin for Claude Code and Codex, or as a plain binary: [docs/setup.md](docs/setup.md).
+Unofficial; built only on documented features (`autoMemoryDirectory`, hooks, plugins).
 
 ## Benchmark
 

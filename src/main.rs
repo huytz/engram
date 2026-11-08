@@ -67,8 +67,17 @@ enum Cmd {
     /// Show devices, seqs and local pending changes
     Status,
     /// Wire hooks + autoMemoryDirectory into Claude Code settings.json
-    InstallHooks,
+    InstallHooks {
+        /// Hooks come from the engram plugin: set autoMemoryDirectory, remove engram hooks
+        #[arg(long)]
+        plugin: bool,
+    },
     UninstallHooks,
+    /// Show or hide per-hook timings (`engram pull 412ms · ...`) in the agent UI
+    HookTiming {
+        #[arg(value_parser = ["on", "off"])]
+        state: String,
+    },
     /// Entry points called by Claude Code hooks (fail soft, log to engram.log)
     Hook {
         event: String,
@@ -439,7 +448,7 @@ async fn init(
         access_key_id: access_key,
         secret_access_key: secret_key,
         collections,
-        hook_timing: true,
+        hook_timing: false,
         device_list_ttl: 600,
         background_pull: true,
     };
@@ -564,6 +573,7 @@ fn spawn_bg() -> Result<()> {
 /// Run one hook event; fills `out` and returns the action label for the status line
 async fn hook(
     event: &str,
+    input: &hooks::HookInput,
     cfg: &Config,
     out: &mut Out,
     t: &mut std::time::Instant,
@@ -587,22 +597,49 @@ async fn hook(
     }
     let _lock = Lock::acquire()?;
     match event {
-        "sessionstart" => do_pull(cfg, None, false, out).await.map(|_| "pull"),
+        "sessionstart" => {
+            do_pull(cfg, None, false, out).await?;
+            if input.codex {
+                codex_memory(cfg, out);
+            }
+            Ok("pull")
+        }
         "posttooluse" => {
-            let Some(fp) = hooks::stdin_file_path() else {
+            let mut cols: Vec<&str> = input
+                .files
+                .iter()
+                .filter_map(|f| cfg.collection_for(f).map(|c| c.name.as_str()))
+                .collect();
+            cols.dedup();
+            if cols.is_empty() {
                 return Ok("");
-            };
-            let Some(col) = cfg.collection_for(&fp) else {
-                return Ok("");
-            };
+            }
             // Let a Write+Edit pair land in one manifest
             tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
             *t = std::time::Instant::now();
-            do_push(cfg, Some(&col.name), out).await.map(|_| "push")
+            let only = (cols.len() == 1).then_some(cols[0]);
+            do_push(cfg, only, out).await.map(|_| "push")
         }
         "stop" => do_push(cfg, None, out).await.map(|_| "push"),
         other => bail!("unknown hook event {other}"),
     }
+}
+
+/// Codex has no autoMemoryDirectory: hand it the memory dir and MEMORY.md at session start
+fn codex_memory(cfg: &Config, out: &mut Out) {
+    let Some(mem) = cfg.collection("memory") else {
+        return;
+    };
+    let dir = expand(&mem.path);
+    let index = std::fs::read_to_string(dir.join("MEMORY.md")).unwrap_or_default();
+    let index: Vec<&str> = index.lines().take(200).collect();
+    out.lines.push(format!(
+        "# engram memory\nPersistent memory shared with Claude Code lives in {}. \
+         Read a topic file there when its index line below is relevant. \
+         To save or update a memory, follow the `engram` skill.\n\n{}",
+        dir.display(),
+        index.join("\n")
+    ));
 }
 
 /// Hook stdout as Claude Code JSON: `systemMessage` shows timings to the user, `additionalContext` feeds Claude
@@ -682,11 +719,21 @@ async fn main() {
             .await
         }
         Cmd::Status => async { status(&Config::load()?).await }.await,
-        Cmd::InstallHooks => Config::load().and_then(|c| hooks::install(&c)).map(|_| {
-            println!(
-                "hooks installed in {}",
-                config::claude_settings_path().display()
-            )
+        Cmd::InstallHooks { plugin } => Config::load()
+            .and_then(|c| hooks::install(&c, plugin))
+            .map(|_| {
+                let what = if plugin {
+                    "autoMemoryDirectory set"
+                } else {
+                    "hooks installed"
+                };
+                println!("{what} in {}", config::claude_settings_path().display())
+            }),
+        Cmd::HookTiming { state } => Config::load().and_then(|mut c| {
+            c.hook_timing = state == "on";
+            c.save()?;
+            println!("hook timing {state}");
+            Ok(())
         }),
         Cmd::UninstallHooks => hooks::uninstall().map(|_| println!("hooks removed")),
         Cmd::Collection { cmd } => collection_cmd(cmd),
@@ -695,9 +742,10 @@ async fn main() {
             // Hooks never block Claude: log, report, exit 0
             let mut t = std::time::Instant::now();
             let mut out = Out::default();
+            let input = hooks::read_input();
             match Config::load() {
                 Ok(cfg) => {
-                    let action = match hook(&event, &cfg, &mut out, &mut t).await {
+                    let action = match hook(&event, &input, &cfg, &mut out, &mut t).await {
                         Ok(a) => a,
                         Err(e) => {
                             log(&format!("hook {event} failed: {e:#}"));

@@ -24,8 +24,8 @@ pub struct Config {
     #[serde(default)]
     pub secret_access_key: Option<String>,
     pub collections: Vec<Collection>,
-    /// Show per-hook timings in Claude Code (`systemMessage`)
-    #[serde(default = "yes")]
+    /// Show per-hook timings in Claude Code (`systemMessage`); off by default
+    #[serde(default)]
     pub hook_timing: bool,
     /// Seconds the prompt hook reuses the device list before a new LIST
     #[serde(default = "list_ttl")]
