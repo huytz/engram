@@ -37,8 +37,8 @@ pub struct Change {
 pub struct Report {
     pub changes: Vec<Change>,
     pub new_index_lines: Vec<String>,
-    /// Devices whose remote data was rejected this pull (reason per line)
-    pub skipped: Vec<String>,
+    /// Security-relevant events of this pull, one line each (skipped devices, dropped keys, new devices)
+    pub warnings: Vec<String>,
     /// Wall time of the network fetch for this collection
     pub ms: u128,
 }
@@ -159,6 +159,17 @@ struct Remote {
     etag: String,
     manifest: Manifest,
     blobs: HashMap<String, Vec<u8>>,
+    /// Manifest entries dropped by `sanitize`
+    dropped: usize,
+}
+
+/// Result of fetching one collection, before anything is written
+struct ColFetch {
+    remotes: Vec<Remote>,
+    listed: bool,
+    warnings: Vec<String>,
+    /// Our own manifest on the remote is missing or not the one we uploaded
+    republish: bool,
 }
 
 /// Prepared upload of one collection: blobs to send, then the manifest that commits them
@@ -206,7 +217,9 @@ impl<'a> Syncer<'a> {
         let mut done = vec![];
         for (plan, (r, ms)) in plans.into_iter().zip(results) {
             match r {
-                Ok(()) => {
+                Ok(etag) => {
+                    self.state.own_etag.insert(plan.col.name.clone(), etag);
+                    self.state.republish.remove(&plan.col.name);
                     done.push(Pushed {
                         col: plan.col,
                         changed: plan.changed,
@@ -295,7 +308,11 @@ impl<'a> Syncer<'a> {
             }
         }
         // Manifests from before the `collection` field are republished once so peers accept them
-        if changed == 0 && own.seq > 0 && own.collection == col.name {
+        if changed == 0
+            && own.seq > 0
+            && own.collection == col.name
+            && !self.state.republish.contains(&col.name)
+        {
             return Ok(None);
         }
         let root = expand(&col.path);
@@ -333,7 +350,7 @@ impl<'a> Syncer<'a> {
     }
 
     /// PUT non-inline blobs, then manifest ∥ inline blobs: 1 round trip if all fit
-    async fn upload(&self, plan: &PushPlan<'_>) -> Result<()> {
+    async fn upload(&self, plan: &PushPlan<'_>) -> Result<String> {
         let (col, dev) = (&plan.col.name, &self.cfg.device);
         let root = expand(&plan.col.path);
         let put_blobs = |inlined: bool| {
@@ -351,6 +368,7 @@ impl<'a> Syncer<'a> {
                         self.backend
                             .put(&blob_key(col, dev, sha), self.keys.encrypt(&data)?)
                             .await
+                            .map(|_| ())
                     }),
             )
             .buffer_unordered(PARALLEL)
@@ -395,14 +413,17 @@ impl<'a> Syncer<'a> {
         let mut out = vec![];
         let mut dirty = false;
         for (col, (f, ms)) in cols.iter().zip(fetched) {
-            let r = f.and_then(|(remotes, listed, skipped)| {
-                if listed {
+            let r = f.and_then(|cf| {
+                if cf.listed {
                     self.state.listed_at.insert(col.name.clone(), now_ts());
                     dirty = true;
                 }
-                dirty |= !remotes.is_empty();
-                self.apply_col(col, remotes).map(|mut r| {
-                    r.skipped = skipped;
+                if cf.republish {
+                    dirty |= self.state.republish.insert(col.name.clone());
+                }
+                dirty |= !cf.remotes.is_empty();
+                self.apply_col(col, cf.remotes).map(|mut r| {
+                    r.warnings = cf.warnings;
                     r
                 })
             });
@@ -423,7 +444,7 @@ impl<'a> Syncer<'a> {
         let mut report = Report {
             changes: vec![],
             new_index_lines: vec![],
-            skipped: vec![],
+            warnings: vec![],
             ms: 0,
         };
         if remotes.is_empty() {
@@ -450,15 +471,16 @@ impl<'a> Syncer<'a> {
     }
 
     /// LIST ∥ known-device GETs, LIST skipped if cache fresh; returns (remotes, listed, skipped devices)
-    async fn fetch_col(&self, col: &Collection) -> Result<(Vec<Remote>, bool, Vec<String>)> {
+    async fn fetch_col(&self, col: &Collection) -> Result<ColFetch> {
         let me = self.cfg.device.as_str();
+        let ignored = |d: &str| self.cfg.ignored_devices.iter().any(|i| i == d);
         let known: Vec<String> = self
             .state
             .devices
             .get(&col.name)
             .into_iter()
             .flat_map(|m| m.keys().cloned())
-            .filter(|d| d != me && valid_device(d))
+            .filter(|d| d != me && valid_device(d) && !ignored(d))
             .collect();
         let fresh_list = self.cached_list
             && !known.is_empty()
@@ -474,36 +496,86 @@ impl<'a> Syncer<'a> {
                 false => self.backend.list_children(&prefix).await.map(Some),
             }
         };
-        let (listed, known_res) =
-            tokio::join!(list, join_all(known.iter().map(|d| self.fetch_dev(col, d))));
+        // Nobody else should write under our name: a changed or missing own manifest means impersonation or loss
+        let own_etag = self.state.own_etag.get(&col.name).cloned();
+        let self_check = async {
+            match &own_etag {
+                Some(et) => self
+                    .backend
+                    .get(&manifest_key(&col.name, me), Some(et))
+                    .await
+                    .ok(),
+                None => None,
+            }
+        };
+        let (listed, known_res, own) = tokio::join!(
+            list,
+            join_all(known.iter().map(|d| self.fetch_dev(col, d))),
+            self_check
+        );
         let listed = listed?;
         let did_list = listed.is_some();
         let mut fresh: Vec<String> = listed
             .unwrap_or_default()
             .into_iter()
-            .filter(|d| d != me && !known.contains(d) && valid_device(d))
+            .filter(|d| d != me && !known.contains(d) && valid_device(d) && !ignored(d))
             .collect();
         fresh.sort();
         fresh.dedup();
         let fresh_res = join_all(fresh.iter().map(|d| self.fetch_dev(col, d))).await;
         // One bad device must not block the others
-        let (mut out, mut skipped) = (vec![], vec![]);
-        for (d, r) in known
+        let (mut out, mut warnings, mut failed) = (vec![], vec![], vec![]);
+        for (i, (d, r)) in known
             .iter()
             .chain(&fresh)
             .zip(known_res.into_iter().chain(fresh_res))
+            .enumerate()
         {
             match r {
-                Ok(r) => out.extend(r),
-                Err(e) => skipped.push(format!("{d}: {e:#}")),
+                Ok(Some(r)) => {
+                    if i >= known.len() {
+                        warnings.push(format!(
+                            "new device {d} (check `engram status` if unexpected)"
+                        ));
+                    }
+                    if r.dropped > 0 {
+                        warnings.push(format!("{d}: ignored {} unsafe file key(s)", r.dropped));
+                    }
+                    out.push(r);
+                }
+                Ok(None) => {}
+                Err(e) => failed.push(format!("skipped {d}: {e:#}")),
             }
         }
         // Every peer rejected (wrong identity, bad config): an error, not a warning
-        if !skipped.is_empty() && skipped.len() == known.len() + fresh.len() {
-            anyhow::bail!("{}", skipped.join("; "));
+        if !failed.is_empty() && failed.len() == known.len() + fresh.len() {
+            anyhow::bail!("{}", failed.join("; "));
         }
+        warnings.extend(failed);
+        let republish = match own {
+            Some(Fetched::Found { .. }) => {
+                warnings.push(format!(
+                    "own manifest {}/{me} was overwritten by another writer; republishing",
+                    col.name
+                ));
+                true
+            }
+            Some(Fetched::Missing) => {
+                warnings.push(format!(
+                    "own manifest {}/{me} is missing; republishing",
+                    col.name
+                ));
+                true
+            }
+            _ => false,
+        };
         out.sort_by(|a, b| a.dev.cmp(&b.dev));
-        Ok((out, did_list, skipped))
+        Ok(ColFetch {
+            remotes: out,
+            listed: did_list,
+            warnings,
+            republish,
+        })
     }
 
     /// Conditional GET of a device manifest plus a parallel fetch of the blobs it will need
@@ -548,7 +620,7 @@ impl<'a> Syncer<'a> {
             "manifest seq {} not newer than {last} (replayed?)",
             manifest.seq
         );
-        sanitize(&mut manifest);
+        let dropped = sanitize(&mut manifest);
         let root = expand(&col.path);
         let mut need: Vec<String> = manifest
             .files
@@ -609,6 +681,7 @@ impl<'a> Syncer<'a> {
             etag,
             manifest,
             blobs,
+            dropped,
         }))
     }
 
@@ -792,8 +865,9 @@ impl<'a> Syncer<'a> {
 }
 
 /// Drop keys that are not plain relative paths, bad shas, case-insensitive duplicates; clamp mtimes
-fn sanitize(m: &mut Manifest) {
+fn sanitize(m: &mut Manifest) -> usize {
     let now = now_ts();
+    let before = m.files.len();
     let mut folded = HashSet::new();
     m.files.retain(|k, e| {
         valid_key(k) && e.sha.as_deref().is_none_or(valid_sha) && folded.insert(k.to_lowercase())
@@ -802,6 +876,7 @@ fn sanitize(m: &mut Manifest) {
         e.mtime = e.mtime.clamp(0, now + MAX_SKEW);
     }
     m.inline.retain(|k, _| valid_sha(k));
+    before - m.files.len()
 }
 
 /// First conflict name not on disk yet, so a later conflict never replaces an earlier copy

@@ -24,6 +24,9 @@ pub struct Config {
     #[serde(default)]
     pub secret_access_key: Option<String>,
     pub collections: Vec<Collection>,
+    /// Devices removed with `engram device remove`; their remote data is never applied again
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ignored_devices: Vec<String>,
     /// Show per-hook timings in Claude Code (`systemMessage`); off by default
     #[serde(default)]
     pub hook_timing: bool,

@@ -22,6 +22,13 @@ from older versions until those devices upgrade (each republishes once automatic
   `state.json` aside, and a collection whose directory is missing is not pushed, so none of these
   can push tombstones that wipe peers. New `engram device remove <name>` deletes a retired
   device's data so its old files stop coming back.
+- Detection: each pull checks this device's own manifest on the remote. If someone else
+  overwrote or deleted it, engram warns and republishes it. A new device name, unsafe keys
+  dropped from a manifest, and skipped devices each print one warning line. The CLI no longer
+  prints `up to date` next to a pull error.
+- `engram device remove` also adds the device to `ignored_devices`, so a token it still holds
+  cannot bring its data back. `SECURITY.md` documents the warning signs and the recovery steps:
+  rotate the token and the identity together.
 - Hardening: `~/.engram` is 0700, log/inbox 0600, state writes use fresh `O_EXCL` temp files, the
   hook command quotes the binary path, CLI pull/push take the hook lock, `collection add` of a
   `.claude` directory excludes `settings*.json`, the launcher requires the checksum line to name

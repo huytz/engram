@@ -63,6 +63,12 @@ pub struct State {
     /// collection -> unix time of the last device LIST
     #[serde(default)]
     pub listed_at: BTreeMap<String, i64>,
+    /// collection -> ETag of our own manifest as we last uploaded it (self-check on pull)
+    #[serde(default)]
+    pub own_etag: BTreeMap<String, String>,
+    /// Collections whose own manifest must be uploaded again (missing or overwritten remotely)
+    #[serde(default)]
+    pub republish: std::collections::BTreeSet<String>,
     /// sha of the plugin list last published
     #[serde(default)]
     pub plugins_sha: Option<String>,
@@ -88,6 +94,8 @@ impl State {
         self.seen.remove(col);
         self.own.remove(col);
         self.listed_at.remove(col);
+        self.own_etag.remove(col);
+        self.republish.remove(col);
     }
 
     /// Drop what we know about one peer device

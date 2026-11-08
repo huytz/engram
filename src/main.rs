@@ -218,9 +218,9 @@ async fn do_pull(cfg: &Config, only: Option<&str>, cached_list: bool, out: &mut 
             n => format!("{n} file(s)"),
         };
         out.timing.push(format!("{} {}ms ({what})", c.name, r.ms));
-        for sk in &r.skipped {
-            log(&format!("pull {}: skipped {sk}", c.name));
-            out.timing.push(format!("{} skipped {sk}", c.name));
+        for w in &r.warnings {
+            log(&format!("pull {}: warning {w}", c.name));
+            out.timing.push(format!("{} warning {w}", c.name));
         }
         let mut by_dev: std::collections::BTreeMap<&str, usize> = Default::default();
         for ch in &r.changes {
@@ -287,10 +287,13 @@ async fn cli_pull(cfg: &Config, only: Option<&str>) -> Result<()> {
     // CLI runs take the same lock as hooks so they never interleave on state.json
     let _lock = Lock::acquire()?;
     let r = do_pull(cfg, only, false, &mut out).await;
-    for t in out.timing.iter().filter(|t| t.contains(" skipped ")) {
-        eprintln!("engram: warning: {t}");
+    for t in out.timing.iter().filter(|t| t.contains(" warning ")) {
+        eprintln!("engram: {t}");
     }
-    print_lines(&out.lines, "engram: up to date");
+    print_lines(
+        &out.lines,
+        if r.is_ok() { "engram: up to date" } else { "" },
+    );
     r
 }
 
@@ -450,7 +453,15 @@ async fn device_remove(cfg: &Config, name: &str) -> Result<()> {
     let mut st = model::State::load()?;
     st.forget_device(name);
     st.save()?;
-    println!("removed {n} object(s) of {name}; other devices drop it on their next LIST");
+    // Its token may still work: never apply what it uploads again
+    let mut cfg = cfg.clone();
+    if !cfg.ignored_devices.iter().any(|d| d == name) {
+        cfg.ignored_devices.push(name.to_string());
+        cfg.save()?;
+    }
+    println!(
+        "removed {n} object(s) of {name} and ignore it from now on; run this on every other device too, then rotate the bucket token and identity (SECURITY.md)"
+    );
     Ok(())
 }
 
@@ -529,6 +540,7 @@ async fn init(
         access_key_id: access_key,
         secret_access_key: secret_key,
         collections,
+        ignored_devices: vec![],
         hook_timing: false,
         device_list_ttl: 600,
         background_pull: true,
@@ -754,7 +766,7 @@ fn hook_output(event: &str, cfg: &Config, action: &str, ms: u128, out: &Out) -> 
     let alert = out
         .timing
         .iter()
-        .any(|t| t.contains("failed") || t.contains(" skipped "));
+        .any(|t| t.contains("failed") || t.contains(" warning "));
     if (cfg.hook_timing || alert) && !action.is_empty() {
         let mut msg = format!("engram {action} {ms}ms");
         if out.timing.is_empty() {

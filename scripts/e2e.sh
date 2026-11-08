@@ -153,8 +153,19 @@ mkdir -p "$T/a/notes"; echo n > "$T/a/notes/n.md"; a collection add notes "$T/a/
 a collection remove notes >/dev/null
 grep -q '"notes"' "$T/a/state.json" && fail "collection remove kept its sync state"
 
-# 15. wrong identity fails cleanly
+# 15. run-2: own manifest overwritten by someone else is detected and republished; removed devices stay ignored
+cp "$T/remote/memory/dev-b/manifest.json" "$T/remote/memory/dev-a/manifest.json"
+a pull 2>&1 | grep -q 'own manifest memory/dev-a was overwritten' || fail "impersonation of own prefix not detected"
+a push >/dev/null; b pull 2>&1 | grep -q 'skipped dev-a' && fail "republished own manifest still rejected by peers"
+forge evil memory "{\"device\":\"evil\",\"collection\":\"memory\",\"seq\":9,\"updated_at\":\"x\",\"files\":{\"evil2.md\":$E},\"inline\":{\"$S\":\"$B64\"}}"
+a pull >/dev/null 2>&1; [ -e "$T/a/memory/evil2.md" ] && fail "removed device was applied again"
+grep -q '"evil"' "$T/a/config.json" || fail "device remove did not add it to ignored_devices"
+a pull 2>&1 | grep -q 'up to date' || true
+
+# 16. wrong identity fails cleanly
 mkdir -p "$T/x"; sed 's/dev-a/intruder/' "$T/a/config.json" > "$T/x/config.json"
-{ ENGRAM_HOME="$T/x" "$BIN" pull 2>&1 || true; } | grep -q "wrong identity" || fail "wrong identity should be rejected"
+{ ENGRAM_HOME="$T/x" "$BIN" pull 2>&1 || true; } > "$T/x.out"
+grep -q "wrong identity" "$T/x.out" || fail "wrong identity should be rejected"
+grep -q "up to date" "$T/x.out" && fail "failed pull must not also say up to date"
 
 echo "e2e OK"

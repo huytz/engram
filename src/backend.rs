@@ -176,7 +176,8 @@ impl Backend {
         }
     }
 
-    pub async fn put(&self, key: &str, data: Vec<u8>) -> Result<()> {
+    /// Upload `data`; returns the ETag a later conditional GET will see
+    pub async fn put(&self, key: &str, data: Vec<u8>) -> Result<String> {
         match self {
             Backend::File { root } => {
                 let p = root.join(key);
@@ -186,10 +187,10 @@ impl Backend {
                 let tmp = p.with_extension("tmp");
                 std::fs::write(&tmp, &data)?;
                 std::fs::rename(tmp, p)?;
-                Ok(())
+                Ok(crate::crypto::sha256_hex(&data))
             }
             Backend::S3 { client, bucket } => {
-                client
+                let out = client
                     .put_object()
                     .bucket(bucket)
                     .key(key)
@@ -197,7 +198,7 @@ impl Backend {
                     .send()
                     .await
                     .map_err(|e| anyhow!("s3 put {key}: {}", e.into_service_error()))?;
-                Ok(())
+                Ok(out.e_tag().unwrap_or_default().to_string())
             }
         }
     }
