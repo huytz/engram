@@ -51,6 +51,9 @@ fn trust_store() -> tls::TrustStore {
         .with_pem_certificate(pem)
 }
 
+/// Largest object engram will buffer; bigger ones are refused
+const MAX_OBJECT: u64 = 256 * 1024 * 1024;
+
 pub enum Fetched {
     NotModified,
     Missing,
@@ -122,6 +125,9 @@ impl Backend {
         match self {
             Backend::File { root } => {
                 let p = root.join(key);
+                if std::fs::metadata(&p).is_ok_and(|m| m.len() > MAX_OBJECT) {
+                    bail!("{key} larger than {MAX_OBJECT} bytes");
+                }
                 let data = match std::fs::read(&p) {
                     Ok(d) => d,
                     Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -142,6 +148,9 @@ impl Backend {
                 }
                 match req.send().await {
                     Ok(out) => {
+                        if out.content_length().is_some_and(|n| n as u64 > MAX_OBJECT) {
+                            bail!("{key} larger than {MAX_OBJECT} bytes");
+                        }
                         let etag = out.e_tag().unwrap_or_default().to_string();
                         let data = out
                             .body
@@ -188,6 +197,37 @@ impl Backend {
                     .send()
                     .await
                     .map_err(|e| anyhow!("s3 put {key}: {}", e.into_service_error()))?;
+                Ok(())
+            }
+        }
+    }
+
+    pub async fn delete(&self, key: &str) -> Result<()> {
+        match self {
+            Backend::File { root } => {
+                let p = root.join(key);
+                match std::fs::remove_file(&p) {
+                    Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e.into()),
+                    _ => {}
+                }
+                // S3 has no directories: prune empty parents so LIST matches
+                let mut d = p.parent();
+                while let Some(dir) = d.filter(|d| d.starts_with(root) && *d != root.as_path()) {
+                    if std::fs::remove_dir(dir).is_err() {
+                        break;
+                    }
+                    d = dir.parent();
+                }
+                Ok(())
+            }
+            Backend::S3 { client, bucket } => {
+                client
+                    .delete_object()
+                    .bucket(bucket)
+                    .key(key)
+                    .send()
+                    .await
+                    .map_err(|e| anyhow!("s3 delete {key}: {}", e.into_service_error()))?;
                 Ok(())
             }
         }

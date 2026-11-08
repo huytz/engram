@@ -3,14 +3,17 @@ use crate::config::{Config, claude_settings_path, expand};
 use anyhow::{Context, Result};
 use serde_json::{Value, json};
 
-const MARK: &str = "engram hook";
+/// Old (unquoted) and new (quoted) engram hook commands
+fn is_engram(e: &Value) -> bool {
+    let s = e.to_string();
+    s.contains("engram hook") || s.contains("engram' hook")
+}
 
 fn hook_entry(event: &str, matcher: Option<&str>, timeout: u64, is_async: bool) -> Value {
     let exe = std::env::current_exe()
         .map(|p| p.display().to_string())
         .unwrap_or_else(|_| "engram".into());
-    let mut h =
-        json!({ "type": "command", "command": format!("{exe} hook {event}"), "timeout": timeout });
+    let mut h = json!({ "type": "command", "command": format!("'{}' hook {event}", exe.replace('\'', "'\\''")), "timeout": timeout });
     if is_async {
         h["async"] = json!(true);
     }
@@ -50,7 +53,7 @@ pub fn install(cfg: &Config, plugin: bool) -> Result<()> {
     for (event, matcher, timeout, is_async) in wanted {
         let list = hooks.entry(event).or_insert_with(|| json!([]));
         let list = list.as_array_mut().context("hook list")?;
-        list.retain(|e| !e.to_string().contains(MARK));
+        list.retain(|e| !is_engram(e));
         if plugin {
             continue;
         }
@@ -77,7 +80,7 @@ pub fn uninstall() -> Result<()> {
         let mut empty = vec![];
         for (ev, list) in hooks.iter_mut() {
             if let Some(a) = list.as_array_mut() {
-                a.retain(|e| !e.to_string().contains(MARK));
+                a.retain(|e| !is_engram(e));
                 if a.is_empty() {
                     empty.push(ev.clone());
                 }

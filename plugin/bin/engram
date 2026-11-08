@@ -1,7 +1,7 @@
 #!/bin/sh
 # Runs the engram release this plugin pins; downloads and sha256-checks it on first use.
 set -eu
-VERSION=0.1.6
+VERSION=0.1.7
 REPO=huytz/engram
 home=${ENGRAM_HOME:-$HOME/.engram}
 bin=${ENGRAM_BIN:-$home/bin/engram-$VERSION}
@@ -21,6 +21,8 @@ fetch() {
   # set -e is off inside `if ! fetch`, so chain every step
   curl -fsSL --max-time 60 -o "$tmp/$name.tar.gz" "$url" &&
     curl -fsSL --max-time 20 -o "$tmp/$name.tar.gz.sha256" "$url.sha256" &&
+    # The checksum line must name this tarball, not some other file
+    awk -v f="$name.tar.gz" 'NF==2 && $2==f && $1 ~ /^[0-9a-f]{64}$/ {ok=1} END {exit !ok}' "$tmp/$name.tar.gz.sha256" &&
     (cd "$tmp" && if command -v shasum >/dev/null; then shasum -a 256 -c "$name.tar.gz.sha256"; else sha256sum -c "$name.tar.gz.sha256"; fi) >/dev/null &&
     tar -xzf "$tmp/$name.tar.gz" -C "$tmp" &&
     mkdir -p "$home/bin" &&

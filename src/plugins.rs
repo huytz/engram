@@ -58,13 +58,26 @@ pub async fn fetch_all(
     let mut out = BTreeMap::new();
     for k in be.list("plugins/").await? {
         let parts: Vec<&str> = k.split('/').collect();
-        if parts.len() != 3 || parts[2] != "list.json" || parts[1] == device {
+        if parts.len() != 3
+            || parts[2] != "list.json"
+            || parts[1] == device
+            || !crate::safety::valid_device(parts[1])
+        {
             continue;
         }
-        if let Fetched::Found { data, .. } = be.get(&k, None).await? {
-            let list: BTreeMap<String, String> = serde_json::from_slice(&keys.decrypt(&data)?)?;
-            out.insert(parts[1].to_string(), list);
-        }
+        // Skip a list that fails to decrypt or parse instead of failing the whole diff
+        let Ok(Fetched::Found { data, .. }) = be.get(&k, None).await else {
+            continue;
+        };
+        let Some(mut list) = keys
+            .decrypt(&data)
+            .ok()
+            .and_then(|d| serde_json::from_slice::<BTreeMap<String, String>>(&d).ok())
+        else {
+            continue;
+        };
+        list.retain(|p, v| crate::safety::valid_plugin(p) && !v.chars().any(char::is_control));
+        out.insert(parts[1].to_string(), list);
     }
     Ok(out)
 }

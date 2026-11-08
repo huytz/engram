@@ -28,6 +28,9 @@ impl Entry {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Manifest {
     pub device: String,
+    /// Collection this manifest belongs to; peers reject a manifest copied under another prefix
+    #[serde(default)]
+    pub collection: String,
     pub seq: u64,
     pub updated_at: String,
     pub files: BTreeMap<String, Entry>,
@@ -75,6 +78,25 @@ impl State {
             Ok(s) => Ok(serde_json::from_str(&s)?),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(State::default()),
             Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Drop all sync bookkeeping for one collection
+    pub fn forget(&mut self, col: &str) {
+        self.devices.remove(col);
+        self.applied.remove(col);
+        self.seen.remove(col);
+        self.own.remove(col);
+        self.listed_at.remove(col);
+    }
+
+    /// Drop what we know about one peer device
+    pub fn forget_device(&mut self, dev: &str) {
+        for m in self.devices.values_mut() {
+            m.remove(dev);
+        }
+        for m in self.seen.values_mut() {
+            m.remove(dev);
         }
     }
 

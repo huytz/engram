@@ -62,12 +62,14 @@ Start a new Claude Code session.
 | `engram status` | devices, sequence numbers, pending changes |
 | `engram collection add <name> <path> [--exclude sub]` | sync another directory (same name on every device) |
 | `engram plugins` | which Claude Code plugins each device is missing |
+| `engram device remove <name>` | delete a retired device's data from the remote (run on another device) |
 | `engram install-hooks [--plugin]` / `uninstall-hooks` | add or remove the hooks in `~/.claude/settings.json` (`--plugin`: only `autoMemoryDirectory`) |
 | `engram hook-timing on\|off` | show or hide per-hook timings in the agent UI (default off) |
 
 Synced by default: `memory` and `skills` (`~/.claude/skills`, minus `synced/`). Add more with
-`collection add`: `~/.claude/plans`, a project's `.claude/` (rules, skills; exclude
-`settings.local.json`), any directory of notes. Plugins are compared, not copied. Never sync
+`collection add`: `~/.claude/plans`, a project's `.claude/` (rules, skills;
+`settings.json` and `settings.local.json` are excluded automatically, since hooks there run
+commands), any directory of notes. Plugins are compared, not copied. Never sync
 session transcripts or caches.
 
 ## Cost

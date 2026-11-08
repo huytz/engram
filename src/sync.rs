@@ -2,6 +2,7 @@ use crate::backend::{Backend, Fetched};
 use crate::config::{Collection, Config, expand};
 use crate::crypto::{Keys, sha256_hex};
 use crate::model::{Entry, Manifest, State, now_rfc3339, now_ts};
+use crate::safety::{confined, valid_device, valid_key, valid_sha};
 use anyhow::{Context, Result};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as B64;
@@ -17,6 +18,8 @@ const INDEX: &str = "MEMORY.md";
 const PARALLEL: usize = 16;
 /// Raw bytes of new blobs a manifest may carry inline
 const INLINE_MAX: usize = 256 * 1024;
+/// Remote mtimes further ahead than this are clamped (seconds)
+const MAX_SKEW: i64 = 86400;
 
 pub struct Local {
     pub sha: String,
@@ -34,6 +37,8 @@ pub struct Change {
 pub struct Report {
     pub changes: Vec<Change>,
     pub new_index_lines: Vec<String>,
+    /// Devices whose remote data was rejected this pull (reason per line)
+    pub skipped: Vec<String>,
     /// Wall time of the network fetch for this collection
     pub ms: u128,
 }
@@ -130,7 +135,12 @@ fn write_file(path: &Path, data: &[u8], mtime: i64) -> Result<()> {
     if let Some(p) = path.parent() {
         std::fs::create_dir_all(p)?;
     }
-    let tmp = path.with_extension("engram-tmp");
+    // Ends in `.tmp` so scans skip it; pid keeps concurrent writers apart
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy())
+        .unwrap_or_default();
+    let tmp = path.with_file_name(format!(".{name}.{}.engram.tmp", std::process::id()));
     std::fs::write(&tmp, data)?;
     std::fs::rename(&tmp, path)?;
     if mtime > 0 {
@@ -223,6 +233,10 @@ impl<'a> Syncer<'a> {
         let dev = &self.cfg.device;
         let empty = Manifest::default();
         let own = self.state.own.get(&col.name).unwrap_or(&empty);
+        // A missing root (unmounted, renamed) must not turn into tombstones for every file
+        if !expand(&col.path).is_dir() {
+            return Ok(None);
+        }
         let local = scan_since(col, Some(own))?;
         // Blobs are content-addressed per device: a sha in our last manifest is already uploaded
         let mut have: HashSet<&str> = own
@@ -280,7 +294,8 @@ impl<'a> Syncer<'a> {
                 }
             }
         }
-        if changed == 0 && own.seq > 0 {
+        // Manifests from before the `collection` field are republished once so peers accept them
+        if changed == 0 && own.seq > 0 && own.collection == col.name {
             return Ok(None);
         }
         let root = expand(&col.path);
@@ -301,7 +316,9 @@ impl<'a> Syncer<'a> {
         }
         let manifest = Manifest {
             device: dev.clone(),
-            seq: own.seq + 1,
+            collection: col.name.clone(),
+            // Peers reject seqs that go back; wall-clock floor survives a lost state.json
+            seq: (own.seq + 1).max(chrono::Utc::now().timestamp_millis() as u64),
             updated_at: now_rfc3339(),
             files,
             inline,
@@ -378,13 +395,16 @@ impl<'a> Syncer<'a> {
         let mut out = vec![];
         let mut dirty = false;
         for (col, (f, ms)) in cols.iter().zip(fetched) {
-            let r = f.and_then(|(remotes, listed)| {
+            let r = f.and_then(|(remotes, listed, skipped)| {
                 if listed {
                     self.state.listed_at.insert(col.name.clone(), now_ts());
                     dirty = true;
                 }
                 dirty |= !remotes.is_empty();
-                self.apply_col(col, remotes)
+                self.apply_col(col, remotes).map(|mut r| {
+                    r.skipped = skipped;
+                    r
+                })
             });
             let r = r.map(|mut r| {
                 r.ms = ms;
@@ -403,6 +423,7 @@ impl<'a> Syncer<'a> {
         let mut report = Report {
             changes: vec![],
             new_index_lines: vec![],
+            skipped: vec![],
             ms: 0,
         };
         if remotes.is_empty() {
@@ -428,8 +449,8 @@ impl<'a> Syncer<'a> {
         Ok(report)
     }
 
-    /// LIST ∥ known-device GETs, LIST skipped if cache fresh; returns (remotes, listed)
-    async fn fetch_col(&self, col: &Collection) -> Result<(Vec<Remote>, bool)> {
+    /// LIST ∥ known-device GETs, LIST skipped if cache fresh; returns (remotes, listed, skipped devices)
+    async fn fetch_col(&self, col: &Collection) -> Result<(Vec<Remote>, bool, Vec<String>)> {
         let me = self.cfg.device.as_str();
         let known: Vec<String> = self
             .state
@@ -437,7 +458,7 @@ impl<'a> Syncer<'a> {
             .get(&col.name)
             .into_iter()
             .flat_map(|m| m.keys().cloned())
-            .filter(|d| d != me)
+            .filter(|d| d != me && valid_device(d))
             .collect();
         let fresh_list = self.cached_list
             && !known.is_empty()
@@ -460,17 +481,29 @@ impl<'a> Syncer<'a> {
         let mut fresh: Vec<String> = listed
             .unwrap_or_default()
             .into_iter()
-            .filter(|d| d != me && !known.contains(d))
+            .filter(|d| d != me && !known.contains(d) && valid_device(d))
             .collect();
         fresh.sort();
         fresh.dedup();
         let fresh_res = join_all(fresh.iter().map(|d| self.fetch_dev(col, d))).await;
-        let mut out = vec![];
-        for r in known_res.into_iter().chain(fresh_res) {
-            out.extend(r?);
+        // One bad device must not block the others
+        let (mut out, mut skipped) = (vec![], vec![]);
+        for (d, r) in known
+            .iter()
+            .chain(&fresh)
+            .zip(known_res.into_iter().chain(fresh_res))
+        {
+            match r {
+                Ok(r) => out.extend(r),
+                Err(e) => skipped.push(format!("{d}: {e:#}")),
+            }
+        }
+        // Every peer rejected (wrong identity, bad config): an error, not a warning
+        if !skipped.is_empty() && skipped.len() == known.len() + fresh.len() {
+            anyhow::bail!("{}", skipped.join("; "));
         }
         out.sort_by(|a, b| a.dev.cmp(&b.dev));
-        Ok((out, did_list))
+        Ok((out, did_list, skipped))
     }
 
     /// Conditional GET of a device manifest plus a parallel fetch of the blobs it will need
@@ -490,8 +523,32 @@ impl<'a> Syncer<'a> {
             Fetched::NotModified | Fetched::Missing => return Ok(None),
             Fetched::Found { data, etag } => (data, etag),
         };
-        let manifest: Manifest =
+        let mut manifest: Manifest =
             serde_json::from_slice(&self.keys.decrypt(&data)?).context("manifest json")?;
+        anyhow::ensure!(
+            !manifest.collection.is_empty(),
+            "{dev} runs engram < 0.1.7; upgrade it so its manifests can be checked"
+        );
+        // A manifest copied to another prefix or replayed from the past is not this device's latest
+        anyhow::ensure!(
+            manifest.device == dev && manifest.collection == col.name,
+            "manifest is for {}/{}, not {}/{dev}",
+            manifest.collection,
+            manifest.device,
+            col.name
+        );
+        let last = self
+            .state
+            .devices
+            .get(&col.name)
+            .and_then(|m| m.get(dev))
+            .map_or(0, |d| d.seq);
+        anyhow::ensure!(
+            manifest.seq > last,
+            "manifest seq {} not newer than {last} (replayed?)",
+            manifest.seq
+        );
+        sanitize(&mut manifest);
         let root = expand(&col.path);
         let mut need: Vec<String> = manifest
             .files
@@ -531,7 +588,14 @@ impl<'a> Syncer<'a> {
                 .get(&blob_key(&col.name, dev, &sha), None)
                 .await?
             {
-                Fetched::Found { data, .. } => Ok((sha.clone(), self.keys.decrypt(&data)?)),
+                Fetched::Found { data, .. } => {
+                    let plain = self.keys.decrypt(&data)?;
+                    anyhow::ensure!(
+                        sha256_hex(&plain) == sha,
+                        "blob {sha} content mismatch on {dev}"
+                    );
+                    Ok((sha.clone(), plain))
+                }
                 _ => anyhow::bail!("blob {sha} missing on {dev}"),
             }
         }))
@@ -584,7 +648,10 @@ impl<'a> Syncer<'a> {
                 index_remote = Some((e.clone(), ekey));
                 continue;
             }
-            let path = root.join(rel);
+            // Symlinked parent inside the root could redirect the write outside it
+            let Some(path) = confined(root, rel) else {
+                continue;
+            };
             let local_data = std::fs::read(&path).ok();
             let local_sha = local_data.as_deref().map(sha256_hex);
             let applied = self
@@ -645,8 +712,11 @@ impl<'a> Syncer<'a> {
                             .as_secs() as i64;
                         let remote_wins = e.mtime > local_mtime
                             || (e.mtime == local_mtime && dev > self.cfg.device.as_str());
-                        let loser =
-                            conflict_name(rel, if remote_wins { &self.cfg.device } else { dev });
+                        let loser = free_conflict_name(
+                            root,
+                            rel,
+                            if remote_wins { &self.cfg.device } else { dev },
+                        );
                         if remote_wins {
                             std::fs::rename(&path, root.join(&loser))?;
                             write_file(&path, data, e.mtime)?;
@@ -719,6 +789,31 @@ impl<'a> Syncer<'a> {
         }
         Ok(())
     }
+}
+
+/// Drop keys that are not plain relative paths, bad shas, case-insensitive duplicates; clamp mtimes
+fn sanitize(m: &mut Manifest) {
+    let now = now_ts();
+    let mut folded = HashSet::new();
+    m.files.retain(|k, e| {
+        valid_key(k) && e.sha.as_deref().is_none_or(valid_sha) && folded.insert(k.to_lowercase())
+    });
+    for e in m.files.values_mut() {
+        e.mtime = e.mtime.clamp(0, now + MAX_SKEW);
+    }
+    m.inline.retain(|k, _| valid_sha(k));
+}
+
+/// First conflict name not on disk yet, so a later conflict never replaces an earlier copy
+fn free_conflict_name(root: &Path, rel: &str, loser_dev: &str) -> String {
+    let base = conflict_name(rel, loser_dev);
+    if !root.join(&base).exists() {
+        return base;
+    }
+    (2..)
+        .map(|n| conflict_name(rel, &format!("{loser_dev}-{n}")))
+        .find(|c| !root.join(c).exists())
+        .unwrap_or(base)
 }
 
 /// `a/b.md` → `a/b.conflict-<dev>.md`; keeps the extension so Claude still reads it as markdown
