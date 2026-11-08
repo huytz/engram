@@ -32,8 +32,21 @@ from the same memory.
 
 `engram hook-timing on` makes each hook report its cost, e.g. `engram pull 412ms · memory 398ms (up to date)`.
 
-Install as a plugin for Claude Code and Codex, or as a plain binary: [docs/setup.md](docs/setup.md).
-Unofficial; built only on documented features (`autoMemoryDirectory`, hooks, plugins).
+## Install
+
+As a plugin for Claude Code and Codex (hooks + an `engram` skill; the release binary is fetched
+and sha256-checked on first use):
+
+```sh
+claude plugin marketplace add huytz/engram && claude plugin install engram@engram
+codex plugin marketplace add huytz/engram && codex plugin add engram@engram
+```
+
+Then `engram init …` and `engram install-hooks --plugin` once per device; in Codex, trust the
+engram hooks when it asks. Codex has no `autoMemoryDirectory`, so engram hands it `MEMORY.md` at
+session start. A plain binary install also works. Bucket setup, commands and options:
+[docs/setup.md](docs/setup.md). Unofficial; built only on documented features
+(`autoMemoryDirectory`, hooks, plugins).
 
 ## Benchmark
 
