@@ -1,6 +1,6 @@
 [package]
 name = "engram"
-version = "0.1.5"
+version = "0.1.6"
 edition = "2024"
 rust-version = "1.85"
 description = "One Claude Code memory for all your devices: encrypted sync of auto-memory and skills through R2/S3"
@@ -14,7 +14,7 @@ authors = ["huytz"]
 
 [dependencies]
 anyhow = "1"
-clap = { version = "4", features = ["derive"] }
+clap = { version = "4", features = ["derive", "env"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 sha2 = "0.11"

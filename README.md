@@ -34,19 +34,29 @@ from the same memory.
 
 ## Install
 
-As a plugin for Claude Code and Codex (hooks + an `engram` skill; the release binary is fetched
-and sha256-checked on first use):
+### Claude Code
 
 ```sh
 claude plugin marketplace add huytz/engram && claude plugin install engram@engram
+```
+
+Start a new session and run `/engram:setup`. It walks you through the R2 bucket and token, then
+gives you the one `engram init` command to run. Keys stay out of the chat. On your other devices,
+run the same install and `/engram:setup`, and answer "yes, engram already runs on another
+device".
+
+### Codex
+
+```sh
 codex plugin marketplace add huytz/engram && codex plugin add engram@engram
 ```
 
-Then `engram init …` and `engram install-hooks --plugin` once per device; in Codex, trust the
-engram hooks when it asks. Codex has no `autoMemoryDirectory`, so engram hands it `MEMORY.md` at
-session start. A plain binary install also works. Bucket setup, commands and options:
-[docs/setup.md](docs/setup.md). Unofficial; built only on documented features
-(`autoMemoryDirectory`, hooks, plugins).
+Start Codex, trust the 4 engram hooks ("Hooks need review"), then ask it to run the engram
+`setup` skill. Skip setup if the device already runs engram for Claude Code. Codex has no
+`autoMemoryDirectory`, so engram gives it `MEMORY.md` at session start.
+
+Plain binary install, manual setup, commands and options: [docs/setup.md](docs/setup.md).
+Unofficial; built only on documented features (`autoMemoryDirectory`, hooks, plugins).
 
 ## Benchmark
 

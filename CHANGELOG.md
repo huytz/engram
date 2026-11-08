@@ -1,6 +1,15 @@
 # Changelog
 
-## Unreleased (0.1.5)
+## 0.1.6 — 2026-11-08
+
+- Guided setup: `/engram:setup` skill (R2 bucket and token, first or extra device, keys never
+  pasted into the chat). Session start says `engram: not set up yet` until `engram init` runs.
+- `engram init --plugin` also sets `autoMemoryDirectory`. Flags read `ENGRAM_REMOTE`,
+  `ENGRAM_ENDPOINT`, `ENGRAM_ACCESS_KEY` and `ENGRAM_SECRET_KEY`. `ENGRAM_IDENTITY` joins an
+  existing remote without copying `identity.txt`.
+- The launcher links the current release as `~/.engram/bin/engram` for use in terminals.
+
+## 0.1.5 — 2026-11-08
 
 - Plugin for Claude Code and Codex (`plugin/`, marketplace at the repo root): hooks, an `engram`
   skill and a launcher that downloads and sha256-checks the pinned release on first use.

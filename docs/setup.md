@@ -2,23 +2,29 @@
 
 ## Install
 
-**Plugin (Claude Code and Codex).** The plugin brings the hooks, an `engram` skill and a
-launcher that downloads the matching release binary on first use (sha256-checked, into
-`~/.engram/bin/`).
+**Claude Code (recommended):**
 
 ```sh
 claude plugin marketplace add huytz/engram && claude plugin install engram@engram
+```
+In a new session, run `/engram:setup`: it guides the steps below. Until setup is done, every
+session start shows `engram: not set up yet`.
+
+**Codex:**
+
+```sh
 codex plugin marketplace add huytz/engram && codex plugin add engram@engram
 ```
-Then use `engram install-hooks --plugin` in step 2 below: it only sets `autoMemoryDirectory`
-(a plugin cannot) and removes hooks a binary install added earlier, so they don't run twice.
+Trust the 4 engram hooks when Codex asks, then ask it to run the engram `setup` skill. Codex has
+no `autoMemoryDirectory`, so the session-start hook gives Codex the memory directory and
+`MEMORY.md`. `apply_patch` edits are pushed the same way as Claude's Edit/Write.
 
-**Binary only.** Download from [Releases](https://github.com/huytz/engram/releases) (macOS,
-Linux) or `cargo install --git https://github.com/huytz/engram`, then `engram install-hooks`.
+The plugin brings the hooks, the `engram` and `setup` skills, and a launcher that downloads the
+pinned release on first use, checks its sha256 and links it as `~/.engram/bin/engram`.
 
-**Codex.** Codex has no `autoMemoryDirectory`, so at session start the hook gives Codex the
-memory directory and `MEMORY.md`; the skill tells it how to save. Edits through `apply_patch`
-are pushed like Claude's Edit/Write.
+**Binary only:** download from [Releases](https://github.com/huytz/engram/releases) or run
+`cargo install --git https://github.com/huytz/engram`. Then use `engram install-hooks` in place of
+`--plugin` below.
 
 ## Setup
 
@@ -33,16 +39,19 @@ that bucket. Keep the key ID, secret, and endpoint `https://<account-id>.r2.clou
 **2. First device**
 
 ```sh
-engram init --remote s3://engram --endpoint https://<account-id>.r2.cloudflarestorage.com \
-  --access-key <KEY_ID> --secret-key <SECRET>
-engram install-hooks            # or --plugin with the plugin
+ENGRAM_ACCESS_KEY=<KEY_ID> ENGRAM_SECRET_KEY=<SECRET> ~/.engram/bin/engram init \
+  --remote s3://engram --endpoint https://<account-id>.r2.cloudflarestorage.com --plugin
 ```
+Every flag can come from the environment: `ENGRAM_REMOTE`, `ENGRAM_ENDPOINT`,
+`ENGRAM_ACCESS_KEY`, `ENGRAM_SECRET_KEY`. `--plugin` also sets `autoMemoryDirectory`. Without the
+plugin, run `engram install-hooks` after init.
 Your existing auto-memory is imported and pushed. **Back up `~/.engram/identity.txt`**: it is
 the only key to the remote copy.
 
 **3. Every other device**
 
-Copy `identity.txt` into `~/.engram/`, run the same two commands. Existing memory is merged.
+Copy `identity.txt` into `~/.engram/`, or set `ENGRAM_IDENTITY='AGE-SECRET-KEY-…'`, then run
+the same command. Existing memory is merged.
 Start a new Claude Code session.
 
 ## Commands
