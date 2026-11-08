@@ -2,8 +2,23 @@
 
 ## Install
 
-Download from [Releases](https://github.com/huytz/engram/releases) (macOS, Linux) or
-`cargo install --git https://github.com/huytz/engram`.
+**Plugin (Claude Code and Codex).** The plugin brings the hooks, an `engram` skill and a
+launcher that downloads the matching release binary on first use (sha256-checked, into
+`~/.engram/bin/`).
+
+```sh
+claude plugin marketplace add huytz/engram && claude plugin install engram@engram
+codex plugin marketplace add huytz/engram && codex plugin add engram@engram
+```
+Then use `engram install-hooks --plugin` in step 2 below: it only sets `autoMemoryDirectory`
+(a plugin cannot) and removes hooks a binary install added earlier, so they don't run twice.
+
+**Binary only.** Download from [Releases](https://github.com/huytz/engram/releases) (macOS,
+Linux) or `cargo install --git https://github.com/huytz/engram`, then `engram install-hooks`.
+
+**Codex.** Codex has no `autoMemoryDirectory`, so at session start the hook gives Codex the
+memory directory and `MEMORY.md`; the skill tells it how to save. Edits through `apply_patch`
+are pushed like Claude's Edit/Write.
 
 ## Setup
 
@@ -20,7 +35,7 @@ that bucket. Keep the key ID, secret, and endpoint `https://<account-id>.r2.clou
 ```sh
 engram init --remote s3://engram --endpoint https://<account-id>.r2.cloudflarestorage.com \
   --access-key <KEY_ID> --secret-key <SECRET>
-engram install-hooks
+engram install-hooks            # or --plugin with the plugin
 ```
 Your existing auto-memory is imported and pushed. **Back up `~/.engram/identity.txt`**: it is
 the only key to the remote copy.
@@ -38,7 +53,8 @@ Start a new Claude Code session.
 | `engram status` | devices, sequence numbers, pending changes |
 | `engram collection add <name> <path> [--exclude sub]` | sync another directory (same name on every device) |
 | `engram plugins` | which Claude Code plugins each device is missing |
-| `engram install-hooks` / `uninstall-hooks` | add or remove the hooks in `~/.claude/settings.json` |
+| `engram install-hooks [--plugin]` / `uninstall-hooks` | add or remove the hooks in `~/.claude/settings.json` (`--plugin`: only `autoMemoryDirectory`) |
+| `engram hook-timing on\|off` | show or hide per-hook timings in the agent UI (default off) |
 
 Synced by default: `memory` and `skills` (`~/.claude/skills`, minus `synced/`). Add more with
 `collection add`: `~/.claude/plans`, a project's `.claude/` (rules, skills; exclude
@@ -62,7 +78,8 @@ the free tier: **$0**.
   but does not shorten it.
 - One memory for all projects (`autoMemoryDirectory` is global).
 - `ENGRAM_HOME` moves `~/.engram`; `file:///dir` is a valid remote for testing.
-- Hooks show their timing in Claude Code; set `"hook_timing": false` in `config.json` to hide it.
+- Hook timings (`engram pull 412ms · …`) are hidden by default; `engram hook-timing on` shows them
+  (`"hook_timing"` in `config.json`).
 - The prompt hook reuses the device list for `"device_list_ttl"` seconds (default 600), so a new
   device shows up at the next session start or within 10 minutes; `0` LISTs on every prompt.
 - `"background_pull": true` (default) makes the prompt hook start the pull in a detached process

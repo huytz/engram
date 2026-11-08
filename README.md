@@ -30,10 +30,23 @@ from the same memory.
 - **Merge, never lose.** `MEMORY.md` is merged line by line; other conflicts keep the newer file
   and save the other as `name.conflict-<device>.md`. Deletions propagate.
 
-Each hook reports its cost in Claude Code, e.g. `engram pull 412ms · memory 398ms (up to date)`.
+`engram hook-timing on` makes each hook report its cost, e.g. `engram pull 412ms · memory 398ms (up to date)`.
 
-Install, setup and commands: [docs/setup.md](docs/setup.md). Unofficial; built only on documented
-Claude Code features (`autoMemoryDirectory`, hooks).
+## Install
+
+As a plugin for Claude Code and Codex (hooks + an `engram` skill; the release binary is fetched
+and sha256-checked on first use):
+
+```sh
+claude plugin marketplace add huytz/engram && claude plugin install engram@engram
+codex plugin marketplace add huytz/engram && codex plugin add engram@engram
+```
+
+Then `engram init …` and `engram install-hooks --plugin` once per device; in Codex, trust the
+engram hooks when it asks. Codex has no `autoMemoryDirectory`, so engram hands it `MEMORY.md` at
+session start. A plain binary install also works. Bucket setup, commands and options:
+[docs/setup.md](docs/setup.md). Unofficial; built only on documented features
+(`autoMemoryDirectory`, hooks, plugins).
 
 ## Benchmark
 

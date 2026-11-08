@@ -1,6 +1,14 @@
 # Changelog
 
-## Unreleased
+## Unreleased (0.1.5)
+
+- Plugin for Claude Code and Codex (`plugin/`, marketplace at the repo root): hooks, an `engram`
+  skill and a launcher that downloads and sha256-checks the pinned release on first use.
+  `engram install-hooks --plugin` sets only `autoMemoryDirectory` and drops old engram hooks.
+- Codex support: session start hands Codex the memory dir and `MEMORY.md` (no
+  `autoMemoryDirectory` there); `apply_patch` edits are pushed like Edit/Write.
+- Hook timings are off by default; `engram hook-timing on|off` toggles them.
+- Hooks read stdin with a 300 ms cap, so a caller that never closes stdin can't hang them.
 
 ## 0.1.4 — 2026-11-05
 

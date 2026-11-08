@@ -1,0 +1,9 @@
+{
+  "name": "engram",
+  "version": "0.1.5",
+  "description": "One memory for Claude Code and Codex on all your devices: hooks pull and push ~/.engram/memory through your own age-encrypted R2/S3 bucket",
+  "author": { "name": "huytz", "url": "https://github.com/huytz" },
+  "repository": "https://github.com/huytz/engram",
+  "license": "MIT",
+  "keywords": ["memory", "sync", "r2", "s3", "codex"]
+}

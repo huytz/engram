@@ -1,0 +1,13 @@
+{
+  "name": "engram",
+  "owner": { "name": "huytz" },
+  "plugins": [
+    {
+      "name": "engram",
+      "source": "./plugin",
+      "description": "Sync agent memory and skills across devices through your own encrypted bucket",
+      "repository": "https://github.com/huytz/engram",
+      "license": "MIT"
+    }
+  ]
+}
