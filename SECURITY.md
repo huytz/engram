@@ -49,8 +49,8 @@ and in `~/.engram/engram.log`) when:
 - this device's own manifest on the remote is missing or was overwritten by someone else
   (engram republishes it).
 
-Also check `engram status` for devices you don't own, and `engram.log` for `from <device>` lines
-you can't explain.
+Also check `engram status` for devices you don't own, and `engram.log` (plus `engram.log.1`, the
+rotated previous part) for `from <device>` lines you can't explain.
 
 ## If a device or the bucket token is compromised
 

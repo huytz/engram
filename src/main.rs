@@ -124,13 +124,18 @@ enum CollectionCmd {
     List,
 }
 
+/// Log size before it is rotated to `engram.log.1` (one old file kept, ~2 MiB total)
+const LOG_MAX: u64 = 1024 * 1024;
+
 fn log(msg: &str) {
     use std::os::unix::fs::OpenOptionsExt;
+    let path = home().join("engram.log");
+    rotate_if_big(&path, LOG_MAX);
     if let Ok(mut f) = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
         .mode(0o600)
-        .open(home().join("engram.log"))
+        .open(&path)
     {
         let _ = writeln!(
             f,
@@ -138,6 +143,32 @@ fn log(msg: &str) {
             chrono::Local::now().format("%Y-%m-%d %H:%M:%S"),
             msg
         );
+    }
+}
+
+/// Move `path` to `path.1` once it reaches `max` bytes, replacing the previous `.1`
+fn rotate_if_big(path: &std::path::Path, max: u64) {
+    if std::fs::metadata(path).is_ok_and(|m| m.len() >= max) {
+        let mut old = path.as_os_str().to_owned();
+        old.push(".1");
+        let _ = std::fs::rename(path, old);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn log_rotates_at_limit() {
+        let d = std::env::temp_dir().join(format!("engram-log-{}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        let p = d.join("engram.log");
+        std::fs::write(&p, vec![b'x'; 10]).unwrap();
+        super::rotate_if_big(&p, 100);
+        assert!(p.exists(), "below limit stays");
+        std::fs::write(&p, vec![b'x'; 100]).unwrap();
+        super::rotate_if_big(&p, 100);
+        assert!(!p.exists() && d.join("engram.log.1").exists());
+        std::fs::remove_dir_all(&d).unwrap();
     }
 }
 
