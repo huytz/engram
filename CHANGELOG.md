@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.1.8 — 2026-11-09
+
+- `engram.log` rotates at 1 MiB to `engram.log.1` (one old file kept), so the log stays under
+  ~2 MiB however long engram runs.
+
 ## 0.1.7 — 2026-11-08
 
 Security fixes from an internal audit. **Upgrade every device**: peers on 0.1.7 skip manifests
