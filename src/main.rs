@@ -5,6 +5,7 @@ mod hooks;
 mod memorymd;
 mod model;
 mod plugins;
+mod safety;
 mod sync;
 
 use anyhow::{Context, Result, bail};
@@ -85,6 +86,11 @@ enum Cmd {
     Hook {
         event: String,
     },
+    /// Manage devices on the remote
+    Device {
+        #[command(subcommand)]
+        cmd: DeviceCmd,
+    },
     /// Manage synced directories
     Collection {
         #[command(subcommand)]
@@ -92,6 +98,12 @@ enum Cmd {
     },
     /// Compare installed Claude Code plugins with other devices
     Plugins,
+}
+
+#[derive(Subcommand)]
+enum DeviceCmd {
+    /// Delete a retired device's data from the remote so its old files stop coming back
+    Remove { name: String },
 }
 
 #[derive(Subcommand)]
@@ -105,7 +117,7 @@ enum CollectionCmd {
         #[arg(long)]
         exclude: Vec<String>,
     },
-    /// Remove a collection from this device's config (remote data is kept)
+    /// Remove a collection from this device's config and sync state (remote data is kept)
     Remove {
         name: String,
     },
@@ -113,9 +125,11 @@ enum CollectionCmd {
 }
 
 fn log(msg: &str) {
+    use std::os::unix::fs::OpenOptionsExt;
     if let Ok(mut f) = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
+        .mode(0o600)
         .open(home().join("engram.log"))
     {
         let _ = writeln!(
@@ -204,6 +218,10 @@ async fn do_pull(cfg: &Config, only: Option<&str>, cached_list: bool, out: &mut 
             n => format!("{n} file(s)"),
         };
         out.timing.push(format!("{} {}ms ({what})", c.name, r.ms));
+        for w in &r.warnings {
+            log(&format!("pull {}: warning {w}", c.name));
+            out.timing.push(format!("{} warning {w}", c.name));
+        }
         let mut by_dev: std::collections::BTreeMap<&str, usize> = Default::default();
         for ch in &r.changes {
             *by_dev.entry(ch.device.as_str()).or_default() += 1;
@@ -266,13 +284,23 @@ async fn do_push(cfg: &Config, only: Option<&str>, out: &mut Out) -> Result<()> 
 /// CLI flavour: print pull lines, or "up to date" when nothing came in
 async fn cli_pull(cfg: &Config, only: Option<&str>) -> Result<()> {
     let mut out = Out::default();
+    // CLI runs take the same lock as hooks so they never interleave on state.json
+    let _lock = Lock::acquire()?;
     let r = do_pull(cfg, only, false, &mut out).await;
-    print_lines(&out.lines, "engram: up to date");
+    for t in out.timing.iter().filter(|t| t.contains(" warning ")) {
+        eprintln!("engram: {t}");
+    }
+    print_lines(
+        &out.lines,
+        if r.is_ok() { "engram: up to date" } else { "" },
+    );
     r
 }
 
 async fn cli_push(cfg: &Config, only: Option<&str>) -> Result<()> {
     let mut out = Out::default();
+    // CLI runs take the same lock as hooks so they never interleave on state.json
+    let _lock = Lock::acquire()?;
     let r = do_push(cfg, only, &mut out).await;
     print_lines(&out.lines, "");
     r
@@ -316,6 +344,15 @@ fn collection_cmd(cmd: CollectionCmd) -> Result<()> {
             if !expand(&path).is_dir() {
                 bail!("{path} is not a directory");
             }
+            let mut exclude = exclude;
+            // Hooks in a synced settings.json would run on every device
+            if path.trim_end_matches('/').ends_with(".claude") {
+                for f in ["settings.json", "settings.local.json"] {
+                    if !exclude.iter().any(|x| x == f) {
+                        exclude.push(f.into());
+                    }
+                }
+            }
             cfg.collections.push(Collection {
                 name: name.clone(),
                 path,
@@ -330,6 +367,11 @@ fn collection_cmd(cmd: CollectionCmd) -> Result<()> {
             if cfg.collections.len() == before {
                 bail!("no collection {name}");
             }
+            // Stale own manifest would push tombstones for every file if the name is re-added
+            let _lock = Lock::acquire()?;
+            let mut st = model::State::load()?;
+            st.forget(&name);
+            st.save()?;
             cfg.save()?;
             println!("removed {name} from this device's config");
         }
@@ -386,6 +428,43 @@ async fn status(cfg: &Config) -> Result<()> {
     Ok(())
 }
 
+/// Delete `<col>/<name>/` for every collection plus `plugins/<name>/`, and forget the device locally
+async fn device_remove(cfg: &Config, name: &str) -> Result<()> {
+    if !safety::valid_device(name) {
+        bail!("invalid device name {name:?}");
+    }
+    if name == cfg.device {
+        bail!("{name} is this device; run `engram device remove` from another device");
+    }
+    let (_keys, be) = open(cfg).await?;
+    let _lock = Lock::acquire()?;
+    let mut n = 0;
+    let prefixes = cfg
+        .collections
+        .iter()
+        .map(|c| format!("{}/{name}/", c.name))
+        .chain([format!("plugins/{name}/")]);
+    for prefix in prefixes {
+        for k in be.list(&prefix).await? {
+            be.delete(&k).await?;
+            n += 1;
+        }
+    }
+    let mut st = model::State::load()?;
+    st.forget_device(name);
+    st.save()?;
+    // Its token may still work: never apply what it uploads again
+    let mut cfg = cfg.clone();
+    if !cfg.ignored_devices.iter().any(|d| d == name) {
+        cfg.ignored_devices.push(name.to_string());
+        cfg.save()?;
+    }
+    println!(
+        "removed {n} object(s) of {name} and ignore it from now on; run this on every other device too, then rotate the bucket token and identity (SECURITY.md)"
+    );
+    Ok(())
+}
+
 /// `hostname -s`, restricted to [A-Za-z0-9._-] so it is a safe S3 key segment
 fn default_device() -> Result<String> {
     let out = std::process::Command::new("hostname")
@@ -425,6 +504,16 @@ async fn init(
         Some(d) => d,
         None => default_device()?,
     };
+    if !safety::valid_device(&device) {
+        bail!("device name must match [A-Za-z0-9._-]{{1,64}}");
+    }
+    // State from an earlier setup would push tombstones for files the new remote never had
+    let st = home().join("state.json");
+    if st.exists() {
+        let bak = home().join(format!("state.json.bak-{}", chrono::Utc::now().timestamp()));
+        std::fs::rename(&st, &bak)?;
+        println!("moved old sync state to {}", bak.display());
+    }
     println!("device: {device}");
     let mem_dir = home().join("memory");
     std::fs::create_dir_all(&mem_dir)?;
@@ -451,6 +540,7 @@ async fn init(
         access_key_id: access_key,
         secret_access_key: secret_key,
         collections,
+        ignored_devices: vec![],
         hook_timing: false,
         device_list_ttl: 600,
         background_pull: true,
@@ -565,9 +655,10 @@ fn inbox_put(out: &Out) -> Result<()> {
         chrono::Utc::now().format("%Y%m%dT%H%M%S%.6f"),
         std::process::id()
     );
-    let tmp = dir.join(format!("{name}.tmp"));
-    std::fs::write(&tmp, serde_json::to_vec(&(&out.lines, &out.timing))?)?;
-    std::fs::rename(&tmp, dir.join(format!("{name}.json")))?;
+    config::write_private(
+        &dir.join(format!("{name}.json")),
+        &serde_json::to_vec(&(&out.lines, &out.timing))?,
+    )?;
     Ok(())
 }
 
@@ -671,7 +762,12 @@ fn not_set_up() -> String {
 /// Hook stdout as Claude Code JSON: `systemMessage` shows timings to the user, `additionalContext` feeds Claude
 fn hook_output(event: &str, cfg: &Config, action: &str, ms: u128, out: &Out) -> Option<String> {
     let mut v = serde_json::Map::new();
-    if cfg.hook_timing && !action.is_empty() {
+    // Failures always surface, even with timings hidden
+    let alert = out
+        .timing
+        .iter()
+        .any(|t| t.contains("failed") || t.contains(" warning "));
+    if (cfg.hook_timing || alert) && !action.is_empty() {
         let mut msg = format!("engram {action} {ms}ms");
         if out.timing.is_empty() {
             msg.push_str(" · no change");
@@ -751,6 +847,9 @@ async fn main() {
             .await
         }
         Cmd::Status => async { status(&Config::load()?).await }.await,
+        Cmd::Device {
+            cmd: DeviceCmd::Remove { name },
+        } => async { device_remove(&Config::load()?, &name).await }.await,
         Cmd::InstallHooks { plugin } => Config::load()
             .and_then(|c| hooks::install(&c, plugin))
             .map(|_| {

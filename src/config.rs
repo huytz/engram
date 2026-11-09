@@ -24,6 +24,9 @@ pub struct Config {
     #[serde(default)]
     pub secret_access_key: Option<String>,
     pub collections: Vec<Collection>,
+    /// Devices removed with `engram device remove`; their remote data is never applied again
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ignored_devices: Vec<String>,
     /// Show per-hook timings in Claude Code (`systemMessage`); off by default
     #[serde(default)]
     pub hook_timing: bool,
@@ -79,7 +82,7 @@ impl Config {
     }
 
     pub fn save(&self) -> Result<()> {
-        std::fs::create_dir_all(home())?;
+        ensure_home()?;
         write_private(
             &Self::path(),
             serde_json::to_string_pretty(self)?.as_bytes(),
@@ -101,17 +104,31 @@ impl Config {
     }
 }
 
+/// `~/.engram` readable by the owner only: it holds the identity, keys and log
+pub fn ensure_home() -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let h = home();
+    std::fs::create_dir_all(&h)?;
+    std::fs::set_permissions(&h, std::fs::Permissions::from_mode(0o700))?;
+    Ok(())
+}
+
 pub fn write_private(path: &Path, data: &[u8]) -> Result<()> {
     use std::os::unix::fs::OpenOptionsExt;
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let tmp = path.with_extension("tmp");
+    // Fresh tmp per writer: O_EXCL never opens an existing file or symlink
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy())
+        .unwrap_or_default();
+    let tmp = path.with_file_name(format!(".{name}.{}.tmp", std::process::id()));
+    let _ = std::fs::remove_file(&tmp);
     {
         let mut f = std::fs::OpenOptions::new()
             .write(true)
-            .create(true)
-            .truncate(true)
+            .create_new(true)
             .mode(0o600)
             .open(&tmp)?;
         std::io::Write::write_all(&mut f, data)?;

@@ -1,5 +1,39 @@
 # Changelog
 
+## 0.1.7 — 2026-11-08
+
+Security fixes from an internal audit. **Upgrade every device**: peers on 0.1.7 skip manifests
+from older versions until those devices upgrade (each republishes once automatically).
+
+- Manifest keys that are not plain relative paths (`..`, absolute, `./`, `//`, control chars),
+  keys under a symlinked directory, and case-insensitive duplicates are ignored on pull. A peer
+  or forged manifest could otherwise write or delete files outside the synced directory.
+- Manifests now carry their collection; a manifest must match its device and collection prefix
+  and have a higher `seq` than the last one accepted. A bucket writer without the identity can no
+  longer replay old manifests (rollback, resurrected or deleted files) or copy one under a new
+  device name. `seq` has a wall-clock floor so a lost `state.json` cannot freeze a device.
+- Blobs fetched by key are checked against their sha256 after decrypt.
+- Device names from the bucket listing must match `[A-Za-z0-9._-]{1,64}`, so a crafted prefix
+  cannot put text into the agent context or the log. Same check for plugin lists.
+- A conflict copy never replaces an earlier one (`name.conflict-<dev>-2.md`).
+- One bad device is skipped with a warning (always shown, even with timings off) instead of
+  failing the whole pull. Remote objects over 256 MiB are refused; mtimes are clamped.
+- Data-loss fixes: `collection remove` forgets that collection's sync state, `init` moves an old
+  `state.json` aside, and a collection whose directory is missing is not pushed, so none of these
+  can push tombstones that wipe peers. New `engram device remove <name>` deletes a retired
+  device's data so its old files stop coming back.
+- Detection: each pull checks this device's own manifest on the remote. If someone else
+  overwrote or deleted it, engram warns and republishes it. A new device name, unsafe keys
+  dropped from a manifest, and skipped devices each print one warning line. The CLI no longer
+  prints `up to date` next to a pull error.
+- `engram device remove` also adds the device to `ignored_devices`, so a token it still holds
+  cannot bring its data back. `SECURITY.md` documents the warning signs and the recovery steps:
+  rotate the token and the identity together.
+- Hardening: `~/.engram` is 0700, log/inbox 0600, state writes use fresh `O_EXCL` temp files, the
+  hook command quotes the binary path, CLI pull/push take the hook lock, `collection add` of a
+  `.claude` directory excludes `settings*.json`, the launcher requires the checksum line to name
+  its tarball, and releases build with `--locked` after `cargo test`.
+
 ## 0.1.6 — 2026-11-08
 
 - Guided setup: `/engram:setup` skill (R2 bucket and token, first or extra device, keys never

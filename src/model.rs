@@ -28,6 +28,9 @@ impl Entry {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Manifest {
     pub device: String,
+    /// Collection this manifest belongs to; peers reject a manifest copied under another prefix
+    #[serde(default)]
+    pub collection: String,
     pub seq: u64,
     pub updated_at: String,
     pub files: BTreeMap<String, Entry>,
@@ -60,6 +63,12 @@ pub struct State {
     /// collection -> unix time of the last device LIST
     #[serde(default)]
     pub listed_at: BTreeMap<String, i64>,
+    /// collection -> ETag of our own manifest as we last uploaded it (self-check on pull)
+    #[serde(default)]
+    pub own_etag: BTreeMap<String, String>,
+    /// Collections whose own manifest must be uploaded again (missing or overwritten remotely)
+    #[serde(default)]
+    pub republish: std::collections::BTreeSet<String>,
     /// sha of the plugin list last published
     #[serde(default)]
     pub plugins_sha: Option<String>,
@@ -75,6 +84,27 @@ impl State {
             Ok(s) => Ok(serde_json::from_str(&s)?),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(State::default()),
             Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Drop all sync bookkeeping for one collection
+    pub fn forget(&mut self, col: &str) {
+        self.devices.remove(col);
+        self.applied.remove(col);
+        self.seen.remove(col);
+        self.own.remove(col);
+        self.listed_at.remove(col);
+        self.own_etag.remove(col);
+        self.republish.remove(col);
+    }
+
+    /// Drop what we know about one peer device
+    pub fn forget_device(&mut self, dev: &str) {
+        for m in self.devices.values_mut() {
+            m.remove(dev);
+        }
+        for m in self.seen.values_mut() {
+            m.remove(dev);
         }
     }
 
