@@ -1,5 +1,17 @@
 # Changelog
 
+## Unreleased
+
+- Pull no longer rolls a file back to an older copy held by a peer (`rsync --update` rule). Every
+  device re-publishes the files it pulled under its own manifest; when such a manifest reached us
+  only after we had pushed a newer version (our push hook was killed before it saved state, or the
+  peer pushed between two of our pushes), the older copy silently overwrote the newer file and
+  dropped our newer MEMORY.md lines, with no conflict copy. A peer entry no newer than our last
+  push of that path is now skipped (logged as `stale`), and an older peer index is merged instead
+  of adopted whole.
+- A push flags its collections for republish before uploading, so a kill mid-push republishes on
+  the next run instead of reporting the own manifest as "overwritten by another writer".
+
 ## 0.1.8 — 2026-11-09
 
 - `engram.log` rotates at 1 MiB to `engram.log.1` (one old file kept), so the log stays under
