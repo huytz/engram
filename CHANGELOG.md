@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.1.9 — 2026-11-10
 
 - Pull no longer rolls a file back to an older copy held by a peer (`rsync --update` rule). Every
   device re-publishes the files it pulled under its own manifest; when such a manifest reached us
