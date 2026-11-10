@@ -208,6 +208,15 @@ impl<'a> Syncer<'a> {
                 }
             }
         }
+        // Kill before commit → republish next run, not an impersonation alarm
+        if !plans.is_empty() {
+            for p in &plans {
+                self.state.republish.insert(p.col.name.clone());
+            }
+            if let Err(e) = self.state.save() {
+                err.get_or_insert(e);
+            }
+        }
         let this = &*self;
         let results = join_all(plans.iter().map(|p| async move {
             let t = Instant::now();
@@ -553,6 +562,13 @@ impl<'a> Syncer<'a> {
         }
         warnings.extend(failed);
         let republish = match own {
+            Some(Fetched::Found { .. }) if self.state.republish.contains(&col.name) => {
+                warnings.push(format!(
+                    "own manifest {}/{me} left by an interrupted push; republishing",
+                    col.name
+                ));
+                true
+            }
             Some(Fetched::Found { .. }) => {
                 warnings.push(format!(
                     "own manifest {}/{me} was overwritten by another writer; republishing",
@@ -695,6 +711,29 @@ impl<'a> Syncer<'a> {
         seen.map(String::as_str) != Some(e.key().as_str())
     }
 
+    fn mark_seen(&mut self, col: &str, dev: &str, rel: &str, key: String) {
+        self.state
+            .seen
+            .entry(col.to_string())
+            .or_default()
+            .entry(dev.to_string())
+            .or_default()
+            .insert(rel.to_string(), key);
+    }
+
+    /// rsync --update: skip a peer entry no newer than our last push of `rel`
+    fn stale(&self, col: &str, dev: &str, rel: &str, e: &Entry) -> bool {
+        let Some(own) = self.state.own.get(col).and_then(|m| m.files.get(rel)) else {
+            return false;
+        };
+        if own.key() == e.key() {
+            return false;
+        }
+        // Tombstones count from deletion time; ties break by device name
+        let at = |x: &Entry| x.deleted_at.unwrap_or(x.mtime);
+        at(e) < at(own) || (at(e) == at(own) && dev < self.cfg.device.as_str())
+    }
+
     fn apply(
         &mut self,
         col: &Collection,
@@ -725,6 +764,15 @@ impl<'a> Syncer<'a> {
             let Some(path) = confined(root, rel) else {
                 continue;
             };
+            if self.stale(&cname, dev, rel, e) {
+                report.changes.push(Change {
+                    device: dev.into(),
+                    path: rel.clone(),
+                    kind: "stale",
+                });
+                self.mark_seen(&cname, dev, rel, ekey);
+                continue;
+            }
             let local_data = std::fs::read(&path).ok();
             let local_sha = local_data.as_deref().map(sha256_hex);
             let applied = self
@@ -811,16 +859,12 @@ impl<'a> Syncer<'a> {
                     }
                 }
             }
-            self.state
-                .seen
-                .entry(cname.clone())
-                .or_default()
-                .entry(dev.into())
-                .or_default()
-                .insert(rel.clone(), ekey);
+            self.mark_seen(&cname, dev, rel, ekey);
         }
 
         if let Some((e, ekey)) = index_remote {
+            // Older peer index may miss our lines: merge it, never adopt whole
+            let stale = self.stale(&cname, dev, INDEX, &e);
             if let Some(rsha) = &e.sha {
                 let path = root.join(INDEX);
                 let remote = String::from_utf8_lossy(blob(rsha)?).to_string();
@@ -832,8 +876,8 @@ impl<'a> Syncer<'a> {
                     .and_then(|a| a.get(INDEX))
                     .cloned();
                 let local_unchanged = Some(sha256_hex(local.as_bytes())) == applied;
-                // No local edits since last sync → remote is strictly newer, adopt it verbatim (propagates removals)
-                let merged = if local.trim().is_empty() || local_unchanged {
+                // Clean local, newer remote → adopt whole so removals propagate
+                let merged = if !stale && (local.trim().is_empty() || local_unchanged) {
                     remote
                 } else {
                     crate::memorymd::merge(&local, &remote, &pulled_files)
@@ -852,13 +896,7 @@ impl<'a> Syncer<'a> {
                     .or_default()
                     .insert(INDEX.into(), sha256_hex(merged.as_bytes()));
             }
-            self.state
-                .seen
-                .entry(cname.clone())
-                .or_default()
-                .entry(dev.into())
-                .or_default()
-                .insert(INDEX.into(), ekey);
+            self.mark_seen(&cname, dev, INDEX, ekey);
         }
         Ok(())
     }

@@ -244,7 +244,8 @@ async fn do_pull(cfg: &Config, only: Option<&str>, cached_list: bool, out: &mut 
                 continue;
             }
         };
-        let what = match r.changes.len() {
+        let pulled = r.changes.iter().filter(|c| c.kind != "stale").count();
+        let what = match pulled {
             0 => "up to date".to_string(),
             n => format!("{n} file(s)"),
         };
@@ -255,7 +256,9 @@ async fn do_pull(cfg: &Config, only: Option<&str>, cached_list: bool, out: &mut 
         }
         let mut by_dev: std::collections::BTreeMap<&str, usize> = Default::default();
         for ch in &r.changes {
-            *by_dev.entry(ch.device.as_str()).or_default() += 1;
+            if ch.kind != "stale" {
+                *by_dev.entry(ch.device.as_str()).or_default() += 1;
+            }
             log(&format!(
                 "pull {}:{} {} from {}",
                 c.name, ch.path, ch.kind, ch.device

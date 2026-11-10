@@ -168,4 +168,18 @@ mkdir -p "$T/x"; sed 's/dev-a/intruder/' "$T/a/config.json" > "$T/x/config.json"
 grep -q "wrong identity" "$T/x.out" || fail "wrong identity should be rejected"
 grep -q "up to date" "$T/x.out" && fail "failed pull must not also say up to date"
 
+# 17. a peer's re-published copy of our older version must not roll back our newer push (rsync --update)
+echo "lu v1" > "$T/a/memory/lu.md"; echo '- [lu](lu.md) — a v1' >> "$T/a/memory/MEMORY.md"; a push >/dev/null
+b pull >/dev/null
+echo "b only" > "$T/b/memory/bo.md"; echo '- [bo](bo.md) — b only' >> "$T/b/memory/MEMORY.md"; b push >/dev/null
+sleep 1.1
+echo "lu v2" > "$T/a/memory/lu.md"
+sed -i.bak 's/a v1/a v2/' "$T/a/memory/MEMORY.md" && rm "$T/a/memory/MEMORY.md.bak"
+a push >/dev/null; a pull >/dev/null
+[ "$(cat "$T/a/memory/lu.md")" = "lu v2" ] || fail "stale peer copy rolled lu.md back"
+grep -q 'a v2' "$T/a/memory/MEMORY.md" || fail "stale peer index replaced our newer index line"
+[ -e "$T/a/memory/lu.conflict-dev-b.md" ] && fail "stale copy must not leave a conflict file"
+[ "$(cat "$T/a/memory/bo.md")" = "b only" ] || fail "new file from the same manifest was skipped"
+b pull >/dev/null; [ "$(cat "$T/b/memory/lu.md")" = "lu v2" ] || fail "peer did not take the newer version"
+
 echo "e2e OK"
