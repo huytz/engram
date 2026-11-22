@@ -1,5 +1,6 @@
 {
   "name": "engram",
+  "description": "engram: sync agent memory and skills across devices through your own encrypted bucket",
   "owner": { "name": "huytz" },
   "plugins": [
     {
